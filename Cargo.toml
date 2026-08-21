@@ -2,25 +2,15 @@
 name = "secpref-kit"
 version = "0.2.0-dev"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT"
-description = "Chromium Secure Preferences toolkit — read, list, verify, and manipulate the per-value HMACs, super-MAC, extension IDs, and encrypted-hash sub-tree that Chromium uses for preferences integrity. Library + standalone `secpref` CLI."
+description = "Rust library for Chromium Secure Preferences integrity: HMACs, extension IDs, DataPack seed extraction, manifests, and preference mutation."
 repository = "https://github.com/shxve/secpref-kit"
 homepage = "https://github.com/shxve/secpref-kit"
 readme = "README.md"
 keywords = ["chromium", "chrome", "security", "browser", "hmac"]
-categories = ["cryptography", "command-line-utilities", "development-tools"]
+categories = ["cryptography", "development-tools"]
 authors = ["shxve <shxve@users.noreply.github.com>"]
-
-[[bin]]
-name = "secpref"
-path = "src/bin/secpref.rs"
-required-features = ["cli"]
-
-[features]
-default = []
-# Build the `secpref` binary. Library consumers should leave this off.
-cli = ["dep:clap", "dep:anyhow", "dep:hex"]
 
 [dependencies]
 base64 = "0.22"
@@ -32,11 +22,7 @@ serde = { version = "1", features = ["derive"] }
 # JSON canonical byte-for-byte compatible with what Chromium wrote.
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
-
-# --- optional deps, only pulled in when the `cli` feature is enabled ---
-clap = { version = "4.5", features = ["derive"], optional = true }
-anyhow = { version = "1", optional = true }
-hex = { version = "0.4", optional = true }
+dunce = "1"
 
 # --- Windows SID helpers (src/sid.rs, #[cfg(windows)]) ---
 # Windows-only, always available on Windows builds. No feature flag —
@@ -47,18 +33,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
-
-[dev-dependencies]
-hex = "0.4"
-serde_json = { version = "1", features = ["preserve_order"] }
-tempfile = "3"
-# CLI integration tests (tests/cli_smoke.rs) — only meaningful when the
-# `cli` feature is enabled (that's when `secpref` binary is built). The
-# tests file itself is `#![cfg(feature = "cli")]` gated.
-assert_cmd = "2"
-predicates = "3"
-base64 = "0.22"
 
 [lints.rust]
 missing_docs = "warn"

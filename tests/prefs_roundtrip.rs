@@ -11,17 +11,15 @@ fn install_flow_produces_valid_macs() {
     let mut prefs_json = json!({});
 
     // Fake manifest → deterministic ext-id.
-    let m = manifest::parse_str(
-        r#"{"name": "Test", "version": "0.1.0", "permissions": ["cookies"]}"#,
-    )
-    .unwrap();
+    let m =
+        manifest::parse_str(r#"{"manifest_version": 3, "name": "Test", "version": "0.1.0", "permissions": ["cookies"]}"#)
+            .unwrap();
     let ext_path = "/tmp/some/ext";
     let ext_id = resolve_ext_id(m.key.as_deref(), ext_path).into_id();
     let settings = manifest::build_default_settings(&m, ext_path);
 
     // Install + developer mode + encrypted-hash bypass + super-MAC.
-    let ext_mac =
-        prefs::add_extension(&mut prefs_json, &ext_id, settings, &SEED, SID).unwrap();
+    let ext_mac = prefs::add_extension(&mut prefs_json, &ext_id, settings, &SEED, SID).unwrap();
     assert_eq!(ext_mac.len(), 64);
 
     prefs::enable_developer_mode(&mut prefs_json, &SEED, SID);
@@ -41,14 +39,7 @@ fn install_flow_produces_valid_macs() {
 fn tampered_extension_fails_verify() {
     let mut prefs_json = json!({});
     let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
-    prefs::add_extension(
-        &mut prefs_json,
-        ext_id,
-        json!({"state": 1}),
-        &SEED,
-        SID,
-    )
-    .unwrap();
+    prefs::add_extension(&mut prefs_json, ext_id, json!({"state": 1}), &SEED, SID).unwrap();
     prefs::enable_developer_mode(&mut prefs_json, &SEED, SID);
     prefs::recompute_super_mac(&mut prefs_json, &SEED, SID);
 
@@ -62,21 +53,17 @@ fn tampered_extension_fails_verify() {
     }
 
     let verdict = prefs::verify_extension(&prefs_json, ext_id, &SEED, SID).unwrap();
-    assert!(!verdict.ext_mac_valid, "tampered extension should fail MAC check");
+    assert!(
+        !verdict.ext_mac_valid,
+        "tampered extension should fail MAC check"
+    );
 }
 
 #[test]
 fn uninstall_removes_settings_and_macs() {
     let mut prefs_json = json!({});
     let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
-    prefs::add_extension(
-        &mut prefs_json,
-        ext_id,
-        json!({"state": 1}),
-        &SEED,
-        SID,
-    )
-    .unwrap();
+    prefs::add_extension(&mut prefs_json, ext_id, json!({"state": 1}), &SEED, SID).unwrap();
 
     prefs::remove_extension(&mut prefs_json, ext_id).unwrap();
 
@@ -87,5 +74,8 @@ fn uninstall_removes_settings_and_macs() {
 fn uninstall_unknown_extension_errors() {
     let mut prefs_json = json!({"extensions": {"settings": {}}});
     let err = prefs::remove_extension(&mut prefs_json, "not-installed").unwrap_err();
-    assert!(matches!(err, secpref_kit::SecPrefError::ExtensionNotFound(_)));
+    assert!(matches!(
+        err,
+        secpref_kit::SecPrefError::ExtensionNotFound(_)
+    ));
 }

@@ -1,19 +1,17 @@
 //! Windows SID helpers.
 //!
 //! Windows-only module (`#[cfg(windows)]` at the crate root). Provides two
-//! primitives the `secpref` CLI and library consumers commonly need:
+//! primitives library consumers commonly need:
 //!
-//! - [`current_user_trimmed`] — the running process user's SID as a
-//!   `S-1-5-21-...`-form string.
+//! - [`machine_id`] — Chromium's Windows device ID: the local machine SID.
+//! - [`current_user_trimmed`] — the running process user's account-domain SID.
 //! - [`lookup_by_name`] — resolve a username (local or `DOMAIN\user`) to
 //!   the same SID string form.
 //!
-//! Both return the SID as `ConvertSidToStringSidW` renders it. The
-//! "trimmed" naming is retained for continuity with Lester's
-//! `lester-win32` API and Chromium's `device_id` terminology; the current
-//! implementation returns the full SID string. Trimming logic can be
-//! added later if Chromium's behaviour turns out to differ on some
-//! edge-case account types.
+//! Chromium obtains the computer name, resolves that name with
+//! `LookupAccountNameW`, and uses the resulting machine SID. A user's full
+//! SID has a final relative identifier (RID); [`current_user_trimmed`] removes
+//! that component for callers that explicitly need the account-domain SID.
 //!
 //! # Safety
 //!
@@ -37,6 +35,7 @@ use windows_sys::Win32::Security::{
     TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
 
 use crate::SecPrefError;
 
@@ -50,7 +49,25 @@ use crate::SecPrefError;
 pub fn current_user_trimmed() -> Result<String, SecPrefError> {
     // SAFETY: every raw pointer is either checked or points into a Vec
     // owned by this stack frame. Handles are wrapped in RAII guards.
-    unsafe { current_user_sid_string() }
+    unsafe { current_user_sid_string() }.and_then(trim_rid)
+}
+
+/// Return Chromium's Windows device ID (the local machine SID).
+///
+/// This mirrors Chromium's `GetDeterministicMachineSpecificId` implementation:
+/// resolve the computer name through `LookupAccountNameW` and stringify the
+/// resulting SID.
+pub fn machine_id() -> Result<String, SecPrefError> {
+    // Windows computer names are at most 63 characters; leave ample room for
+    // the terminating NUL and future platform changes.
+    let mut buffer = vec![0u16; 256];
+    let mut length = u32::try_from(buffer.len()).expect("fixed buffer fits u32");
+    // SAFETY: buffer is writable for `length` UTF-16 code units.
+    if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut length) } == 0 {
+        return Err(last_error("GetComputerNameW"));
+    }
+    let name = String::from_utf16_lossy(&buffer[..length as usize]);
+    lookup_by_name(&name)
 }
 
 /// Look up a user's SID by name.
@@ -101,6 +118,18 @@ unsafe fn current_user_sid_string() -> Result<String, SecPrefError> {
     // TOKEN_USER's first field is a SID_AND_ATTRIBUTES with a PSID.
     let token_user = buf.as_ptr().cast::<TOKEN_USER>();
     sid_to_string((*token_user).User.Sid)
+}
+
+fn trim_rid(sid: String) -> Result<String, SecPrefError> {
+    let (domain_sid, rid) = sid.rsplit_once('-').ok_or_else(|| {
+        SecPrefError::SidLookup(format!("cannot remove RID from malformed SID `{sid}`"))
+    })?;
+    if rid.parse::<u32>().is_err() || !domain_sid.starts_with("S-1-") {
+        return Err(SecPrefError::SidLookup(format!(
+            "cannot remove RID from malformed SID `{sid}`"
+        )));
+    }
+    Ok(domain_sid.to_owned())
 }
 
 unsafe fn lookup_sid_string(user: &str) -> Result<String, SecPrefError> {
@@ -191,6 +220,21 @@ mod tests {
         assert!(sid.starts_with("S-1-"), "unexpected SID shape: {sid}");
         // Typical user account: S-1-5-21-...-<RID>
         assert!(sid.matches('-').count() >= 3, "SID looks too short: {sid}");
+    }
+
+    #[test]
+    fn trim_rid_removes_only_the_final_component() {
+        assert_eq!(
+            trim_rid("S-1-5-21-111-222-333-1001".into()).unwrap(),
+            "S-1-5-21-111-222-333"
+        );
+        assert!(trim_rid("not-a-sid".into()).is_err());
+    }
+
+    #[test]
+    fn machine_id_returns_sid_shape() {
+        let sid = machine_id().expect("machine_id");
+        assert!(sid.starts_with("S-1-"), "unexpected SID shape: {sid}");
     }
 
     #[test]

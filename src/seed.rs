@@ -16,6 +16,9 @@
 //! | 12+    | `[u16 id, u32 offset]` × (`resource_count` + 1) | entry table with a sentinel |
 //! | ...    | `u8`  | resource data                    |
 //!
+//! The entry table is followed by `alias_count` four-byte alias records; the
+//! first resource offset must begin at or after both tables.
+//!
 //! Each resource's length is derived from the difference between its offset
 //! and the next entry's offset.
 
@@ -31,6 +34,7 @@ pub const SEED_LEN: usize = 64;
 const DATAPACK_VERSION: u32 = 5;
 const HEADER_LEN: usize = 12;
 const ENTRY_LEN: usize = 6; // u16 resource_id + u32 offset
+const ALIAS_LEN: usize = 4; // u16 resource_id + u16 target resource index
 
 /// Read the seed from a `resources.pak` file on disk.
 ///
@@ -65,20 +69,35 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
         )));
     }
 
-    let resource_count = u16::from_le_bytes(data[8..10].try_into().expect("checked len ≥ 12"))
-        as usize;
-    let _alias_count = u16::from_le_bytes(data[10..12].try_into().expect("checked len ≥ 12"));
+    let encoding = u32::from_le_bytes(data[4..8].try_into().expect("checked len ≥ 12"));
+    if encoding > 2 {
+        return Err(SecPrefError::InvalidPak(format!(
+            "invalid DataPack encoding {encoding}"
+        )));
+    }
+
+    let resource_count =
+        u16::from_le_bytes(data[8..10].try_into().expect("checked len ≥ 12")) as usize;
+    let alias_count =
+        u16::from_le_bytes(data[10..12].try_into().expect("checked len ≥ 12")) as usize;
 
     // +1 sentinel entry gives every real entry a "next offset" to subtract.
-    let total_entries = resource_count.checked_add(1).ok_or_else(|| {
-        SecPrefError::InvalidPak("resource_count + 1 overflows usize".into())
-    })?;
-    let entries_bytes = total_entries.checked_mul(ENTRY_LEN).ok_or_else(|| {
-        SecPrefError::InvalidPak("entry table size overflows usize".into())
-    })?;
-    if data.len() < HEADER_LEN + entries_bytes {
+    let total_entries = resource_count
+        .checked_add(1)
+        .ok_or_else(|| SecPrefError::InvalidPak("resource_count + 1 overflows usize".into()))?;
+    let entries_bytes = total_entries
+        .checked_mul(ENTRY_LEN)
+        .ok_or_else(|| SecPrefError::InvalidPak("entry table size overflows usize".into()))?;
+    let alias_bytes = alias_count
+        .checked_mul(ALIAS_LEN)
+        .ok_or_else(|| SecPrefError::InvalidPak("alias table size overflows usize".into()))?;
+    let data_start = HEADER_LEN
+        .checked_add(entries_bytes)
+        .and_then(|size| size.checked_add(alias_bytes))
+        .ok_or_else(|| SecPrefError::InvalidPak("DataPack table size overflows usize".into()))?;
+    if data.len() < data_start {
         return Err(SecPrefError::InvalidPak(
-            "resources.pak truncated: not enough entry data".into(),
+            "resources.pak truncated: not enough entry or alias data".into(),
         ));
     }
 
@@ -96,13 +115,24 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
                 .expect("bounded by entries_bytes (+ sentinel)"),
         ) as usize;
 
-        let len = next_offset.saturating_sub(offset);
+        if offset < data_start {
+            return Err(SecPrefError::InvalidPak(format!(
+                "resource {i} offset points inside DataPack tables"
+            )));
+        }
+        if next_offset < offset {
+            return Err(SecPrefError::InvalidPak(format!(
+                "resource offsets are not monotonic at entry {i}"
+            )));
+        }
+        if next_offset > data.len() {
+            return Err(SecPrefError::InvalidPak(
+                "resource offset exceeds file size".into(),
+            ));
+        }
+
+        let len = next_offset - offset;
         if len == SEED_LEN {
-            if next_offset > data.len() {
-                return Err(SecPrefError::InvalidPak(
-                    "resource offset exceeds file size".into(),
-                ));
-            }
             return Ok(data[offset..next_offset].to_vec());
         }
     }
@@ -133,7 +163,7 @@ mod tests {
         buf.extend_from_slice(&1u16.to_le_bytes()); // resource_count = 1
         buf.extend_from_slice(&0u16.to_le_bytes()); // alias_count = 0
         // 2 entries (1 real + 1 sentinel).
-        let data_start = (HEADER_LEN + 2 * ENTRY_LEN) as u32;
+        let data_start = u32::try_from(HEADER_LEN + 2 * ENTRY_LEN).unwrap();
         let data_end = data_start + SEED_LEN as u32;
         // entry 0: id=1, offset=data_start
         buf.extend_from_slice(&1u16.to_le_bytes());
@@ -164,6 +194,34 @@ mod tests {
     #[test]
     fn rejects_truncated_header() {
         let pak = vec![5u8, 0, 0, 0]; // just the version, nothing else
+        let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
+        assert!(matches!(err, SecPrefError::InvalidPak(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_encoding() {
+        let mut pak = vec![0u8; HEADER_LEN];
+        pak[0..4].copy_from_slice(&DATAPACK_VERSION.to_le_bytes());
+        pak[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
+        assert!(matches!(err, SecPrefError::InvalidPak(_)));
+    }
+
+    #[test]
+    fn rejects_resource_offset_inside_alias_table() {
+        let seed = [0xAB; SEED_LEN];
+        let mut pak = synthetic_pak_with_seed(&seed);
+        pak[10..12].copy_from_slice(&1u16.to_le_bytes());
+        let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
+        assert!(matches!(err, SecPrefError::InvalidPak(_)));
+    }
+
+    #[test]
+    fn rejects_descending_resource_offsets() {
+        let seed = [0xAB; SEED_LEN];
+        let mut pak = synthetic_pak_with_seed(&seed);
+        let data_start = u32::try_from(HEADER_LEN + 2 * ENTRY_LEN).unwrap();
+        pak[20..24].copy_from_slice(&(data_start - 1).to_le_bytes());
         let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
         assert!(matches!(err, SecPrefError::InvalidPak(_)));
     }

@@ -37,20 +37,26 @@ use crate::{mac, SecPrefError};
 
 /// Result of [`verify_extension`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent integrity checks, not object state
 pub struct VerifyResult {
     /// Whether the stored extension MAC matches a fresh computation.
     pub ext_mac_valid: bool,
     /// Whether the stored `extensions.ui.developer_mode` MAC matches.
     pub dev_mac_valid: bool,
+    /// Whether the signed-in `account_values` developer-mode MAC matches.
+    pub account_dev_mac_valid: bool,
     /// Whether the stored `protection.super_mac` matches.
     pub super_mac_valid: bool,
 }
 
 impl VerifyResult {
-    /// `true` iff all three checks passed.
+    /// `true` iff all four checks passed.
     #[must_use]
     pub fn all_valid(&self) -> bool {
-        self.ext_mac_valid && self.dev_mac_valid && self.super_mac_valid
+        self.ext_mac_valid
+            && self.dev_mac_valid
+            && self.account_dev_mac_valid
+            && self.super_mac_valid
     }
 }
 
@@ -100,8 +106,11 @@ pub fn add_extension(
     let path = format!("extensions.settings.{ext_id}");
     let ext_mac = mac::compute_mac(seed, device_id, &path, &settings);
 
-    ensure_object(prefs_json, &["protection", "macs", "extensions", "settings"])
-        .insert(ext_id.to_string(), Value::String(ext_mac.clone()));
+    ensure_object(
+        prefs_json,
+        &["protection", "macs", "extensions", "settings"],
+    )
+    .insert(ext_id.to_string(), Value::String(ext_mac.clone()));
 
     Ok(ext_mac)
 }
@@ -119,11 +128,9 @@ pub fn remove_extension(prefs_json: &mut Value, ext_id: &str) -> Result<(), SecP
         .get_mut("extensions")
         .and_then(|e| e.get_mut("settings"))
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            SecPrefError::UnexpectedShape {
-                path: "extensions.settings".into(),
-                reason: "missing or non-object".into(),
-            }
+        .ok_or_else(|| SecPrefError::UnexpectedShape {
+            path: "extensions.settings".into(),
+            reason: "missing or non-object".into(),
         })?;
 
     if settings.swap_remove(ext_id).is_none() {
@@ -259,6 +266,11 @@ pub fn verify_extension(
     let computed_ext_mac = mac::compute_mac(seed, device_id, &path, ext_settings);
     let ext_mac_valid = computed_ext_mac.eq_ignore_ascii_case(stored_ext_mac);
 
+    let dev_value = prefs_json
+        .get("extensions")
+        .and_then(|e| e.get("ui"))
+        .and_then(|u| u.get("developer_mode"))
+        .unwrap_or(&Value::Null);
     let stored_dev_mac = prefs_json
         .get("protection")
         .and_then(|p| p.get("macs"))
@@ -268,13 +280,33 @@ pub fn verify_extension(
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    let computed_dev_mac = mac::compute_mac(
+    let computed_dev_mac =
+        mac::compute_mac(seed, device_id, "extensions.ui.developer_mode", dev_value);
+    let dev_mac_valid = computed_dev_mac.eq_ignore_ascii_case(stored_dev_mac);
+
+    let account_dev_value = prefs_json
+        .get("account_values")
+        .and_then(|a| a.get("extensions"))
+        .and_then(|e| e.get("ui"))
+        .and_then(|u| u.get("developer_mode"))
+        .unwrap_or(&Value::Null);
+    let stored_account_dev_mac = prefs_json
+        .get("protection")
+        .and_then(|p| p.get("macs"))
+        .and_then(|m| m.get("account_values"))
+        .and_then(|a| a.get("extensions"))
+        .and_then(|e| e.get("ui"))
+        .and_then(|u| u.get("developer_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let computed_account_dev_mac = mac::compute_mac(
         seed,
         device_id,
-        "extensions.ui.developer_mode",
-        &Value::Bool(true),
+        "account_values.extensions.ui.developer_mode",
+        account_dev_value,
     );
-    let dev_mac_valid = computed_dev_mac.eq_ignore_ascii_case(stored_dev_mac);
+    let account_dev_mac_valid =
+        computed_account_dev_mac.eq_ignore_ascii_case(stored_account_dev_mac);
 
     let stored_super = prefs_json
         .get("protection")
@@ -293,6 +325,7 @@ pub fn verify_extension(
     Ok(VerifyResult {
         ext_mac_valid,
         dev_mac_valid,
+        account_dev_mac_valid,
         super_mac_valid,
     })
 }
@@ -303,7 +336,8 @@ pub fn verify_extension(
 /// list if `extensions.settings` is missing.
 #[must_use]
 pub fn list_extensions(prefs_json: &Value) -> Vec<ExtInfo> {
-    let Some(Value::Object(settings)) = prefs_json.get("extensions").and_then(|e| e.get("settings"))
+    let Some(Value::Object(settings)) =
+        prefs_json.get("extensions").and_then(|e| e.get("settings"))
     else {
         return Vec::new();
     };
@@ -473,13 +507,41 @@ mod tests {
         let seed = [3u8; 64];
         let sid = "S-1-5-21-1";
 
-        add_extension(&mut prefs, ext_id, json!({"state": 1, "location": 4}), &seed, sid).unwrap();
+        add_extension(
+            &mut prefs,
+            ext_id,
+            json!({"state": 1, "location": 4}),
+            &seed,
+            sid,
+        )
+        .unwrap();
         enable_developer_mode(&mut prefs, &seed, sid);
         strip_encrypted_hashes(&mut prefs);
         recompute_super_mac(&mut prefs, &seed, sid);
 
         let verdict = verify_extension(&prefs, ext_id, &seed, sid).unwrap();
         assert!(verdict.all_valid(), "verify_extension: {verdict:?}");
+    }
+
+    #[test]
+    fn verify_extension_checks_stored_developer_mode_values_and_both_macs() {
+        let mut prefs = json!({});
+        let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
+        let seed = [3u8; 64];
+        let device_id = "S-1-5-21-1";
+
+        add_extension(&mut prefs, ext_id, json!({"state": 1}), &seed, device_id).unwrap();
+        enable_developer_mode(&mut prefs, &seed, device_id);
+        recompute_super_mac(&mut prefs, &seed, device_id);
+
+        prefs["extensions"]["ui"]["developer_mode"] = Value::Bool(false);
+        let verdict = verify_extension(&prefs, ext_id, &seed, device_id).unwrap();
+        assert!(!verdict.dev_mac_valid);
+
+        prefs["extensions"]["ui"]["developer_mode"] = Value::Bool(true);
+        prefs["account_values"]["extensions"]["ui"]["developer_mode"] = Value::Bool(false);
+        let verdict = verify_extension(&prefs, ext_id, &seed, device_id).unwrap();
+        assert!(!verdict.account_dev_mac_valid);
     }
 
     #[test]

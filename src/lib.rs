@@ -2,7 +2,7 @@
 //!
 //! Rust implementation of the HMAC-SHA256 integrity primitives Chromium uses
 //! to protect the `Secure Preferences` file. Given the browser's `chrome_seed`
-//! (extracted from `resources.pak`) and the current user's SID, this library
+//! (extracted from `resources.pak`) and Chromium's platform device ID, this library
 //! computes:
 //!
 //! - Per-value MACs stored under `protection.macs.<path>`.
@@ -16,12 +16,12 @@
 //! # What this crate is
 //!
 //! A pure-logic library. No filesystem writes, no registry access, no process
-//! management. All primitives are functions that take inputs (seed, SID, path,
+//! management. All primitives are functions that take inputs (seed, device ID, path,
 //! value) and return bytes / JSON. Consumers decide how to apply them.
 //!
 //! # What this crate is not
 //!
-//! - Not a CLI (see [`shxve/SilentChrome`] for one).
+//! - Not browser discovery (see [`shxve/SilentChrome`] for orchestration).
 //! - Not an extension file installer (consumer writes the files).
 //! - Not an NMH / registry installer (see the future `nmh-install` crate).
 //! - Not browser discovery (consumer knows which browser + user profile).
@@ -33,7 +33,7 @@
 //! use serde_json::json;
 //!
 //! let seed: [u8; 64] = *b"..............................................................64";
-//! let sid = "S-1-5-21-123-456-789-1001";
+//! let device_id = "S-1-5-21-123-456-789";
 //!
 //! // Derive an extension ID from a path.
 //! let ext_id = derive_from_path(r"C:\Users\user\ext-dir");
@@ -41,12 +41,12 @@
 //! // Compute a per-preference MAC.
 //! let path = format!("extensions.settings.{ext_id}");
 //! let value = json!({"state": 1, "location": 4});
-//! let mac = compute_mac(&seed, sid, &path, &value);
+//! let mac = compute_mac(&seed, device_id, &path, &value);
 //! assert_eq!(mac.len(), 64); // uppercase hex, 32 bytes
 //!
 //! // Compute the super-MAC over the protection.macs sub-tree.
 //! let macs = json!({"extensions": {"settings": {ext_id.clone(): mac}}});
-//! let super_mac = compute_super_mac(&seed, sid, &macs);
+//! let super_mac = compute_super_mac(&seed, device_id, &macs);
 //! assert_eq!(super_mac.len(), 64);
 //! ```
 //!
@@ -66,11 +66,11 @@
 //! let settings = manifest::build_default_settings(&m, ext_path);
 //!
 //! let seed = [0u8; 64];
-//! let sid = "S-1-5-21-...";
-//! prefs::add_extension(&mut prefs_json, &ext_id, settings, &seed, sid).unwrap();
-//! prefs::enable_developer_mode(&mut prefs_json, &seed, sid);
+//! let device_id = "S-1-5-21-...";
+//! prefs::add_extension(&mut prefs_json, &ext_id, settings, &seed, device_id).unwrap();
+//! prefs::enable_developer_mode(&mut prefs_json, &seed, device_id);
 //! prefs::strip_encrypted_hashes(&mut prefs_json);
-//! let _super_mac = prefs::recompute_super_mac(&mut prefs_json, &seed, sid);
+//! let _super_mac = prefs::recompute_super_mac(&mut prefs_json, &seed, device_id);
 //! // Consumer now serialises `prefs_json` and writes it to disk atomically.
 //! ```
 //!
@@ -105,7 +105,9 @@ pub mod seed;
 pub mod sid;
 
 pub use error::SecPrefError;
-pub use ext_id::{derive_from_key, derive_from_path, resolve as resolve_ext_id, ExtId};
+pub use ext_id::{
+    canonical_extension_path, derive_from_key, derive_from_path, resolve as resolve_ext_id, ExtId,
+};
 pub use mac::{canonicalize, compute_mac, compute_super_mac, strip_empties};
 pub use prefs::VerifyResult;
 pub use seed::{extract_seed_from_pak, extract_seed_from_pak_bytes, SEED_LEN};

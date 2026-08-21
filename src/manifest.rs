@@ -60,16 +60,36 @@ pub fn parse(dir: &Path) -> Result<Manifest, SecPrefError> {
 pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
     let raw: Value = serde_json::from_str(json_str)?;
 
+    if !raw.is_object() {
+        return Err(SecPrefError::InvalidManifest(
+            "manifest root must be an object".into(),
+        ));
+    }
+
+    let manifest_version = raw
+        .get("manifest_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            SecPrefError::InvalidManifest("missing integer `manifest_version`".into())
+        })?;
+    if !matches!(manifest_version, 2 | 3) {
+        return Err(SecPrefError::InvalidManifest(format!(
+            "unsupported `manifest_version` {manifest_version}"
+        )));
+    }
+
     let name = raw
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| SecPrefError::InvalidManifest("missing non-empty string `name`".into()))?
         .to_string();
 
     let version = raw
         .get("version")
         .and_then(Value::as_str)
-        .unwrap_or("1.0")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| SecPrefError::InvalidManifest("missing non-empty string `version`".into()))?
         .to_string();
 
     let permissions = extract_string_array(&raw, "permissions");
@@ -153,8 +173,7 @@ pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
     });
 
     if manifest.service_worker.is_some() {
-        settings["service_worker_registration_info"] =
-            json!({ "version": manifest.version });
+        settings["service_worker_registration_info"] = json!({ "version": manifest.version });
     }
 
     settings
@@ -189,7 +208,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_manifest() {
-        let json = r#"{"name": "Hello", "version": "1.2.3", "permissions": ["cookies"]}"#;
+        let json = r#"{"manifest_version": 3, "name": "Hello", "version": "1.2.3", "permissions": ["cookies"]}"#;
         let m = parse_str(json).unwrap();
         assert_eq!(m.name, "Hello");
         assert_eq!(m.version, "1.2.3");
@@ -201,6 +220,7 @@ mod tests {
     #[test]
     fn parse_extracts_mv3_service_worker() {
         let json = r#"{
+            "manifest_version": 3,
             "name": "SW",
             "version": "0.1",
             "background": {"service_worker": "worker.js", "type": "module"}
@@ -211,11 +231,23 @@ mod tests {
 
     #[test]
     fn build_default_settings_populates_manifest_and_path() {
-        let m = parse_str(r#"{"name": "N", "version": "1.0"}"#).unwrap();
+        let m = parse_str(r#"{"manifest_version": 3, "name": "N", "version": "1.0"}"#).unwrap();
         let s = build_default_settings(&m, "/opt/ext");
         assert_eq!(s.get("path").and_then(Value::as_str), Some("/opt/ext"));
         assert_eq!(s.get("state").and_then(Value::as_i64), Some(1));
         assert_eq!(s.get("location").and_then(Value::as_i64), Some(4));
         assert!(s.get("manifest").is_some());
+    }
+
+    #[test]
+    fn rejects_missing_required_fields() {
+        assert!(matches!(
+            parse_str(r#"{"name":"N","version":"1"}"#),
+            Err(SecPrefError::InvalidManifest(_))
+        ));
+        assert!(matches!(
+            parse_str(r#"{"manifest_version":3,"name":"","version":"1"}"#),
+            Err(SecPrefError::InvalidManifest(_))
+        ));
     }
 }

@@ -1,6 +1,8 @@
 //! Extension-ID derivation coverage.
 
-use secpref_kit::{derive_from_key, derive_from_path, resolve_ext_id, ExtId};
+#[cfg(not(target_os = "windows"))]
+use secpref_kit::derive_from_path;
+use secpref_kit::{derive_from_key, resolve_ext_id, ExtId};
 
 #[test]
 fn from_key_matches_pinned_vector() {

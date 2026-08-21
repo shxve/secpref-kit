@@ -15,8 +15,27 @@
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 use crate::SecPrefError;
+
+/// Canonicalize an extension directory and return both its path and UTF-8 form.
+///
+/// Chromium hashes and stores the absolute, normalized path for unpacked
+/// extensions. Keeping the string and filesystem path together prevents the
+/// manifest reader, ID derivation, and stored settings from disagreeing.
+pub fn canonical_extension_path(path: impl AsRef<Path>) -> Result<(PathBuf, String), SecPrefError> {
+    let canonical = dunce::canonicalize(path.as_ref()).map_err(|error| {
+        SecPrefError::InvalidExtensionPath(format!("{}: {error}", path.as_ref().display()))
+    })?;
+    let string = canonical.to_str().ok_or_else(|| {
+        SecPrefError::InvalidExtensionPath(format!(
+            "{} cannot be represented as UTF-8",
+            canonical.display()
+        ))
+    })?;
+    Ok((canonical.clone(), string.to_owned()))
+}
 
 /// The 32-character Chromium extension ID.
 ///

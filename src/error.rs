@@ -29,6 +29,14 @@ pub enum SecPrefError {
     #[error("invalid manifest key: {0}")]
     InvalidManifestKey(String),
 
+    /// The extension manifest was valid JSON but not a valid Chromium manifest.
+    #[error("invalid extension manifest: {0}")]
+    InvalidManifest(String),
+
+    /// The extension path could not be canonicalized or represented as UTF-8.
+    #[error("invalid extension path: {0}")]
+    InvalidExtensionPath(String),
+
     /// A required JSON field was not the expected shape.
     #[error("unexpected JSON shape at `{path}`: {reason}")]
     UnexpectedShape {

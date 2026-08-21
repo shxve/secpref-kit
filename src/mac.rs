@@ -2,9 +2,9 @@
 //!
 //! Two MACs matter:
 //!
-//! 1. **Per-value MAC** ([`compute_mac`]): `HMAC-SHA256(seed, sid || path || canonical(value))`
+//! 1. **Per-value MAC** ([`compute_mac`]): `HMAC-SHA256(seed, device_id || path || canonical(value))`
 //!    stored under `protection.macs.<dot-separated-path>`.
-//! 2. **Super-MAC** ([`compute_super_mac`]): `HMAC-SHA256(seed, sid || compact_json(macs))`
+//! 2. **Super-MAC** ([`compute_super_mac`]): `HMAC-SHA256(seed, device_id || compact_json(macs))`
 //!    stored at `protection.super_mac`, covering the entire `protection.macs`
 //!    dictionary.
 //!
@@ -30,9 +30,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// `HMAC-SHA256(seed, device_id || pref_path || canonicalize(value))` → 64 hex chars.
 ///
 /// - `seed` — 64-byte `chrome_seed` from `resources.pak` (see [`crate::seed`]).
-/// - `device_id` — for the machine-scoped MAC, the trimmed user SID (e.g.
-///   `S-1-5-21-...-1001`). Pass `""` for the "raw" MAC used in some Chromium
-///   test vectors.
+/// - `device_id` — Chromium's machine-scoped identifier (the machine SID on
+///   Windows). Pass `""` for Linux or the raw MAC used in test vectors.
 /// - `pref_path` — dotted preference path (e.g.
 ///   `extensions.settings.abcdefgh...`).
 /// - `value` — the exact JSON value stored at that path.
