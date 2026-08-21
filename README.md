@@ -1,6 +1,6 @@
 # secpref-kit
 
-Rust library for Chromium's Secure Preferences integrity model.
+Rust library for Chromium's legacy Secure Preferences HMAC model.
 [`SilentChrome`](https://github.com/shxve/SilentChrome) integrates it into a
 complete browser-aware tool and serves as the reference consumer.
 
@@ -15,6 +15,10 @@ complete browser-aware tool and serves as the reference consumer.
 
 The library mutates in-memory JSON. Browser discovery, process coordination,
 CLI design, and write policy belong to consumers such as SilentChrome.
+
+`verify_extension` checks internal consistency of the legacy MAC family only.
+It does not validate encrypted hashes or establish that a current Chromium
+build will retain and activate a modified extension record.
 
 ## Library
 

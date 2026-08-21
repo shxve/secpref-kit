@@ -12,8 +12,10 @@
 //!
 //! The canonicalisation rules for the `value` in per-value MACs (implemented
 //! by [`canonicalize`] + [`strip_empties`]) mirror Chromium's `JSONWriter`:
-//! insertion-order keys (requires `serde_json` `preserve_order`), no
-//! whitespace, empty containers / nulls stripped, `<` escaped as `<`.
+//! dictionary keys are sorted lexically, JSON is compact, recursively empty
+//! dictionaries/lists are omitted only when the root value is a dictionary,
+//! scalar values such as empty strings and `null` are preserved, and `<` is
+//! escaped as `\u003C`.
 //! Get any of those wrong and the MAC will not match what the browser
 //! computes on load.
 
@@ -59,13 +61,11 @@ pub fn compute_mac(seed: &[u8], device_id: &str, pref_path: &str, value: &Value)
 /// The `macs` value should be a JSON object whose nested structure mirrors
 /// every path that has a per-value MAC (e.g. `{"extensions":{"settings":{"<id>":"<hex>"}, "ui":{"developer_mode":"<hex>"}}}`).
 ///
-/// Ordering: the sub-tree is serialised with `serde_json` (which — with
-/// `preserve_order` enabled — writes keys in insertion order). Chromium
-/// itself does not sort here; matching insertion order is the correctness
-/// requirement.
+/// Chromium treats the MAC table as a dictionary value, so this uses the same
+/// sorted-key, empty-container filtering as [`compute_mac`].
 #[must_use]
 pub fn compute_super_mac(seed: &[u8], device_id: &str, macs: &Value) -> String {
-    let macs_json = serde_json::to_string(macs).expect("macs serialization");
+    let macs_json = canonicalize(macs);
     let message = format!("{device_id}{macs_json}");
     hmac_hex(seed, message.as_bytes())
 }
@@ -84,7 +84,7 @@ pub fn compute_mac_bytes(seed: &[u8], device_id: &str, pref_path: &str, value: &
 /// Compute the super-MAC as raw bytes (32 bytes).
 #[must_use]
 pub fn compute_super_mac_bytes(seed: &[u8], device_id: &str, macs: &Value) -> [u8; 32] {
-    let macs_json = serde_json::to_string(macs).expect("macs serialization");
+    let macs_json = canonicalize(macs);
     let message = format!("{device_id}{macs_json}");
     hmac_bytes(seed, message.as_bytes())
 }
@@ -93,22 +93,25 @@ pub fn compute_super_mac_bytes(seed: &[u8], device_id: &str, macs: &Value) -> [u
 /// conventions:
 ///
 /// 1. Compact (no whitespace).
-/// 2. Insertion-order keys — relies on `serde_json`'s `preserve_order`
-///    feature (enabled by this crate).
-/// 3. Strip empty objects/arrays/strings and nulls (preserve `false` and `0`).
-/// 4. Replace `<` with `<` (Chromium escapes it to prevent XSS if the
+/// 2. Lexically sorted object keys at every nesting level.
+/// 3. For a dictionary root, recursively remove empty objects and arrays while
+///    preserving empty strings, `null`, `false`, and numeric zero. Non-object
+///    roots are serialized without the empty-container filtering pass.
+/// 4. Replace `<` with `\u003C` (Chromium escapes it to prevent XSS if the
 ///    JSON is ever embedded in HTML).
 #[must_use]
 pub fn canonicalize(value: &Value) -> String {
     let mut v = value.clone();
-    strip_empties(&mut v);
+    if v.is_object() {
+        strip_empties(&mut v);
+    }
+    sort_object_keys(&mut v);
     let json = serde_json::to_string(&v).expect("JSON serialization");
     json.replace('<', "\\u003C")
 }
 
-/// Recursively remove keys whose values are empty objects, empty arrays,
-/// empty strings, or null. Preserves `false` and `0` — those are meaningful
-/// values Chromium keeps.
+/// Recursively remove empty objects and arrays from dictionaries and lists.
+/// Scalar values, including empty strings and `null`, are preserved.
 ///
 /// Run twice at each object level so that stripping an inner empty object
 /// which then empties its parent is caught on the second pass.
@@ -147,9 +150,27 @@ fn is_empty(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.is_empty(),
         Value::Array(arr) => arr.is_empty(),
-        Value::String(s) => s.is_empty(),
-        Value::Null => true,
         _ => false,
+    }
+}
+
+fn sort_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let old = std::mem::take(map);
+            let mut entries: Vec<_> = old.into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (_, child) in &mut entries {
+                sort_object_keys(child);
+            }
+            map.extend(entries);
+        }
+        Value::Array(items) => {
+            for item in items {
+                sort_object_keys(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -209,15 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn strip_empties_preserves_false_and_zero() {
+    fn strip_empties_removes_only_empty_containers() {
         let mut v = json!({
             "keep": 42,
             "keep_false": false,
             "keep_zero": 0,
             "drop_empty_obj": {},
             "drop_empty_arr": [],
-            "drop_empty_str": "",
-            "drop_null": null,
+            "keep_empty_str": "",
+            "keep_null": null,
             "nested": {"inner_keep": "yes", "inner_drop": {}}
         });
         strip_empties(&mut v);
@@ -226,8 +247,8 @@ mod tests {
         assert!(v.get("keep_zero").is_some());
         assert!(v.get("drop_empty_obj").is_none());
         assert!(v.get("drop_empty_arr").is_none());
-        assert!(v.get("drop_empty_str").is_none());
-        assert!(v.get("drop_null").is_none());
+        assert_eq!(v.get("keep_empty_str"), Some(&Value::String(String::new())));
+        assert_eq!(v.get("keep_null"), Some(&Value::Null));
         let nested = v.get("nested").unwrap();
         assert!(nested.get("inner_keep").is_some());
         assert!(nested.get("inner_drop").is_none());
@@ -239,5 +260,23 @@ mod tests {
         let c = canonicalize(&v);
         assert!(c.contains("\\u003C"));
         assert!(!c.contains('<'));
+    }
+
+    #[test]
+    fn canonicalize_matches_chromium_dictionary_rules() {
+        let value: Value = serde_json::from_str(
+            r#"{"z":0,"a":{"drop":{},"keep":"","nil":null},"list":[{},[],{"b":2,"a":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonicalize(&value),
+            r#"{"a":{"keep":"","nil":null},"list":[{"a":1,"b":2}],"z":0}"#
+        );
+    }
+
+    #[test]
+    fn canonicalize_does_not_filter_non_dictionary_root() {
+        let value = json!([{}, [], "", null]);
+        assert_eq!(canonicalize(&value), r#"[{},[],"",null]"#);
     }
 }

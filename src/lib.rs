@@ -9,9 +9,8 @@
 //! - The `super_mac` covering the whole `protection.macs` sub-tree.
 //! - Extension IDs derived from a manifest `key` (SHA-256 + Chrome's `[a-p]`
 //!   nibble encoding) or from an extension's on-disk path.
-//! - The self-healing bypass: dropping every `*_encrypted_hash` key, which
-//!   causes Chromium to regenerate them from the (now attacker-computed) MACs
-//!   on next startup.
+//! - Removal of `*_encrypted_hash` keys to request the conditional legacy-MAC
+//!   fallback used by some Chromium builds.
 //!
 //! # What this crate is
 //!
@@ -24,7 +23,8 @@
 //! - Not browser discovery (see [`shxve/SilentChrome`] for orchestration).
 //! - Not an extension file installer (consumer writes the files).
 //! - Not an NMH / registry installer (see the future `nmh-install` crate).
-//! - Not browser discovery (consumer knows which browser + user profile).
+//! - Not a browser-acceptance oracle: legacy MAC self-consistency does not
+//!   validate encrypted hashes or prove restart retention and activation.
 //!
 //! # Quick tour
 //!
@@ -84,9 +84,8 @@
 //! - `asaurusrex/Silent_Chrome` (upstream Python implementation).
 //! - `KingOfTheNOPs/SilentChrome-BOF` (Cobalt Strike BOF).
 //!
-//! Publishing a clean Rust implementation neither adds nor subtracts from the
-//! defender's detection surface — the primitive has been public and unchanged
-//! for five years. Blue teams can use this crate for integrity auditing:
+//! The underlying legacy primitive has been public for years. Blue teams can
+//! use this crate for integrity auditing:
 //! compute the expected MACs and compare against what is written on disk.
 //!
 //! [`shxve/SilentChrome`]: https://github.com/shxve/SilentChrome

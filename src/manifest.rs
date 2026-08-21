@@ -116,9 +116,10 @@ pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
 
 /// Build the `extensions.settings.<id>` JSON blob for a sideloaded extension.
 ///
-/// Produces the shape Chromium writes for an **unpacked** extension in
-/// developer mode (state=1, location=4). Consumers can override any field
-/// by mutating the returned `Value` before passing it to
+/// Produces a conservative current shape for an **unpacked** extension at
+/// location 4. Chromium reloads unpacked manifests from disk, so the record
+/// deliberately does not cache the manifest or service-worker lifecycle state.
+/// Consumers can override any field by mutating the returned `Value` before passing it to
 /// [`crate::prefs::add_extension`].
 #[must_use]
 pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
@@ -136,8 +137,7 @@ pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
         .map(|s| Value::String(s.clone()))
         .collect();
 
-    let mut settings = json!({
-        "account_extension_type": 0,
+    json!({
         "active_permissions": {
             "api": all_permissions,
             "explicit_host": all_hosts,
@@ -147,8 +147,8 @@ pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
         "commands": {},
         "content_settings": [],
         "creation_flags": 38,
+        "disable_reasons": [],
         "first_install_time": now,
-        "from_bookmark": false,
         "from_webstore": false,
         "granted_permissions": {
             "api": all_permissions,
@@ -156,27 +156,17 @@ pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
             "manifest_permissions": [],
             "scriptable_host": []
         },
-        "incognito": true,
         "incognito_content_settings": [],
         "incognito_preferences": {},
         "last_update_time": now,
         "location": 4,
-        "manifest": manifest.raw,
-        "newAllowFileAccess": true,
         "path": ext_path,
         "preferences": {},
         "regular_only_preferences": {},
-        "state": 1,
         "was_installed_by_default": false,
         "was_installed_by_oem": false,
         "withholding_permissions": false
-    });
-
-    if manifest.service_worker.is_some() {
-        settings["service_worker_registration_info"] = json!({ "version": manifest.version });
-    }
-
-    settings
+    })
 }
 
 fn filetime_now() -> String {
@@ -230,13 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn build_default_settings_populates_manifest_and_path() {
+    fn build_default_settings_uses_current_unpacked_shape() {
         let m = parse_str(r#"{"manifest_version": 3, "name": "N", "version": "1.0"}"#).unwrap();
         let s = build_default_settings(&m, "/opt/ext");
         assert_eq!(s.get("path").and_then(Value::as_str), Some("/opt/ext"));
-        assert_eq!(s.get("state").and_then(Value::as_i64), Some(1));
         assert_eq!(s.get("location").and_then(Value::as_i64), Some(4));
-        assert!(s.get("manifest").is_some());
+        assert!(s.get("manifest").is_none());
+        assert!(s.get("service_worker_registration_info").is_none());
+        assert_eq!(s.get("disable_reasons"), Some(&json!([])));
     }
 
     #[test]

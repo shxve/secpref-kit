@@ -17,9 +17,9 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-# preserve_order matters: Chromium's HMAC input is insertion-order JSON, not
-# alphabetically sorted. Serializing with preserve_order keeps the forger's
-# JSON canonical byte-for-byte compatible with what Chromium wrote.
+# Preserve parsed preference-file order for loss-minimizing in-memory mutation.
+# MAC canonicalization sorts cloned dictionary values explicitly to match
+# Chromium's base::Value::Dict semantics.
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 dunce = "1"

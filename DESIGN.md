@@ -1,7 +1,7 @@
 # secpref-kit design
 
-`secpref-kit` is the authoritative Rust implementation of Chromium's Secure
-Preferences integrity model. It serves library consumers without taking
+`secpref-kit` is an experimental Rust implementation of Chromium's legacy
+Secure Preferences HMAC model. It serves library consumers without taking
 ownership of browser discovery, process management, filesystem writes, or CLI
 design.
 
@@ -21,16 +21,18 @@ browser-aware consumer.
 
 ## Correctness decisions
 
-1. `serde_json` uses `preserve_order`. Chromium signs serialized JSON, so key
-   order is part of the integrity input.
+1. `serde_json` uses `preserve_order` to avoid gratuitously reordering the
+   stored file. MAC input is separate: dictionary keys are sorted recursively,
+   matching Chromium's `base::Value::Dict` semantics.
 2. Extension paths are canonicalized once and the same UTF-8 representation is
    used for manifest access, ID derivation, and stored settings.
 3. DataPack parsing validates the encoding, entry table, alias table, monotonic
    offsets, and file bounds before slicing.
 4. Verification recomputes MACs from the values actually stored. It checks the
    extension, both developer-mode mirrors, and the super-MAC independently.
-5. Encrypted hashes are removed before the super-MAC is recomputed. Consumers
-   must preserve this operation order.
+5. Encrypted hashes may be removed before the super-MAC is recomputed to request
+   legacy fallback. Current Chromium can disable that fallback, so a passing
+   legacy self-check is not browser acceptance.
 6. The Windows device ID follows Chromium: obtain the computer name, resolve it
    with `LookupAccountNameW`, and stringify the resulting machine SID.
 
@@ -56,7 +58,14 @@ SilentChrome depends on this crate and retains only:
 
 It must not carry duplicate crypto, DataPack, manifest, extension-ID, or
 preference-integrity implementations. Its round-trip test is the consumer
-contract: output produced through SilentChrome must verify through this crate.
+contract for internal legacy-model consistency, not Chromium acceptance.
+
+## Compatibility boundary
+
+The crate does not generate encrypted integrity values and cannot by itself
+prove that a current browser will retain or activate a modified record. Browser
+acceptance requires a closed-browser write followed by restart, retention,
+loading, and activation checks against the exact target build.
 
 ## Validation gates
 

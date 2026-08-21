@@ -31,18 +31,41 @@ fn mac_object_value_with_seed_and_sid() {
 }
 
 #[test]
-fn insertion_order_is_significant() {
-    // Two objects with the same keys but different insertion order MUST
-    // produce different MACs — this is the whole reason we depend on
-    // `serde_json`'s `preserve_order`.
+fn dictionary_insertion_order_is_not_significant() {
+    // Chromium's base::Value::Dict is sorted, so equivalent dictionaries must
+    // produce the same MAC regardless of input insertion order.
     let a: Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
     let b: Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
     let seed = [b'K'; 64];
     let mac_a = compute_mac(&seed, "sid", "x", &a);
     let mac_b = compute_mac(&seed, "sid", "x", &b);
-    assert_ne!(
+    assert_eq!(
         mac_a, mac_b,
-        "insertion order must affect MAC — check preserve_order feature"
+        "dictionary keys must be sorted before MAC computation"
+    );
+}
+
+#[test]
+fn chromium_dictionary_canonicalization_vector() {
+    let seed = [b'K'; 64];
+    let value: Value = serde_json::from_str(
+        r#"{"z":0,"a":{"drop":{},"keep":"","nil":null},"list":[{},[],{"b":2,"a":1}]}"#,
+    )
+    .unwrap();
+    let mac = compute_mac(&seed, "sid", "x", &value);
+    assert_eq!(
+        mac,
+        "AE4E565D29D086B6B2ED99695605946A19F2975369BED631AA2A98F71F325B05"
+    );
+}
+
+#[test]
+fn super_mac_uses_sorted_dictionary_serialization() {
+    let seed = [b'K'; 64];
+    let macs: Value = serde_json::from_str(r#"{"z":"ZZZZ","a":"AAAA"}"#).unwrap();
+    assert_eq!(
+        compute_super_mac(&seed, "sid", &macs),
+        "4ECF5F1F64B2BF53C78EF5CB954F1322BFEFC70DFCA0C7BAF2B917D010F01A88"
     );
 }
 
