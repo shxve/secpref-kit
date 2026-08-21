@@ -1,8 +1,8 @@
 # secpref-kit
 
-Rust library for Chromium's Secure Preferences integrity model. It is the
-single implementation consumed by
-[`SilentChrome`](https://github.com/shxve/SilentChrome).
+Rust library for Chromium's Secure Preferences integrity model.
+[`SilentChrome`](https://github.com/shxve/SilentChrome) integrates it into a
+complete browser-aware tool and serves as the reference consumer.
 
 ## Capabilities
 

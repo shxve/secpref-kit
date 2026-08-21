@@ -49,7 +49,7 @@ use crate::SecPrefError;
 pub fn current_user_trimmed() -> Result<String, SecPrefError> {
     // SAFETY: every raw pointer is either checked or points into a Vec
     // owned by this stack frame. Handles are wrapped in RAII guards.
-    unsafe { current_user_sid_string() }.and_then(trim_rid)
+    unsafe { current_user_sid_string() }.and_then(|sid| trim_rid(&sid))
 }
 
 /// Return Chromium's Windows device ID (the local machine SID).
@@ -63,7 +63,7 @@ pub fn machine_id() -> Result<String, SecPrefError> {
     let mut buffer = vec![0u16; 256];
     let mut length = u32::try_from(buffer.len()).expect("fixed buffer fits u32");
     // SAFETY: buffer is writable for `length` UTF-16 code units.
-    if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut length) } == 0 {
+    if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &raw mut length) } == 0 {
         return Err(last_error("GetComputerNameW"));
     }
     let name = String::from_utf16_lossy(&buffer[..length as usize]);
@@ -90,7 +90,7 @@ pub fn lookup_by_name(user: &str) -> Result<String, SecPrefError> {
 unsafe fn current_user_sid_string() -> Result<String, SecPrefError> {
     let process = GetCurrentProcess();
     let mut token: HANDLE = ptr::null_mut();
-    if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+    if OpenProcessToken(process, TOKEN_QUERY, &raw mut token) == 0 {
         return Err(last_error("OpenProcessToken"));
     }
     let _guard = HandleGuard(token);
@@ -98,18 +98,22 @@ unsafe fn current_user_sid_string() -> Result<String, SecPrefError> {
     // First call: query the required buffer size. Expected to fail with
     // ERROR_INSUFFICIENT_BUFFER — anything else is a real error.
     let mut needed: u32 = 0;
-    GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed);
+    GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut needed);
     if GetLastError() != ERROR_INSUFFICIENT_BUFFER {
         return Err(last_error("GetTokenInformation size"));
     }
 
-    let mut buf = vec![0u8; needed as usize];
+    // Use pointer-sized storage so casting the buffer to TOKEN_USER preserves
+    // the alignment required by the Win32 structure.
+    let word_size = std::mem::size_of::<usize>();
+    let word_count = (needed as usize).div_ceil(word_size);
+    let mut buf = vec![0usize; word_count];
     if GetTokenInformation(
         token,
         TokenUser,
         buf.as_mut_ptr().cast(),
         needed,
-        &mut needed,
+        &raw mut needed,
     ) == 0
     {
         return Err(last_error("GetTokenInformation"));
@@ -120,7 +124,7 @@ unsafe fn current_user_sid_string() -> Result<String, SecPrefError> {
     sid_to_string((*token_user).User.Sid)
 }
 
-fn trim_rid(sid: String) -> Result<String, SecPrefError> {
+fn trim_rid(sid: &str) -> Result<String, SecPrefError> {
     let (domain_sid, rid) = sid.rsplit_once('-').ok_or_else(|| {
         SecPrefError::SidLookup(format!("cannot remove RID from malformed SID `{sid}`"))
     })?;
@@ -144,10 +148,10 @@ unsafe fn lookup_sid_string(user: &str) -> Result<String, SecPrefError> {
         ptr::null(),
         user_wide.as_ptr(),
         ptr::null_mut(),
-        &mut sid_size,
+        &raw mut sid_size,
         ptr::null_mut(),
-        &mut domain_size,
-        &mut sid_use,
+        &raw mut domain_size,
+        &raw mut sid_use,
     );
     if GetLastError() != ERROR_INSUFFICIENT_BUFFER {
         return Err(last_error("LookupAccountNameW size"));
@@ -160,10 +164,10 @@ unsafe fn lookup_sid_string(user: &str) -> Result<String, SecPrefError> {
         ptr::null(),
         user_wide.as_ptr(),
         sid_buf.as_mut_ptr().cast(),
-        &mut sid_size,
+        &raw mut sid_size,
         domain_buf.as_mut_ptr(),
-        &mut domain_size,
-        &mut sid_use,
+        &raw mut domain_size,
+        &raw mut sid_use,
     ) == 0
     {
         return Err(last_error("LookupAccountNameW"));
@@ -174,7 +178,7 @@ unsafe fn lookup_sid_string(user: &str) -> Result<String, SecPrefError> {
 
 unsafe fn sid_to_string(sid: PSID) -> Result<String, SecPrefError> {
     let mut wide_ptr: *mut u16 = ptr::null_mut();
-    if ConvertSidToStringSidW(sid, &mut wide_ptr) == 0 {
+    if ConvertSidToStringSidW(sid, &raw mut wide_ptr) == 0 {
         return Err(last_error("ConvertSidToStringSidW"));
     }
     let s = wide_to_string(wide_ptr);
@@ -225,10 +229,10 @@ mod tests {
     #[test]
     fn trim_rid_removes_only_the_final_component() {
         assert_eq!(
-            trim_rid("S-1-5-21-111-222-333-1001".into()).unwrap(),
+            trim_rid("S-1-5-21-111-222-333-1001").unwrap(),
             "S-1-5-21-111-222-333"
         );
-        assert!(trim_rid("not-a-sid".into()).is_err());
+        assert!(trim_rid("not-a-sid").is_err());
     }
 
     #[test]
