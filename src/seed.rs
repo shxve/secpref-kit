@@ -158,11 +158,11 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn synthetic_pak_with_seed(seed: &[u8; SEED_LEN]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&DATAPACK_VERSION.to_le_bytes()); // version
-        buf.extend_from_slice(&0u32.to_le_bytes()); // encoding
-        buf.extend_from_slice(&1u16.to_le_bytes()); // resource_count = 1
-        buf.extend_from_slice(&0u16.to_le_bytes()); // alias_count = 0
-        // 2 entries (1 real + 1 sentinel).
+        // DataPack v5 header followed by two entries (one resource + sentinel).
+        buf.extend_from_slice(&DATAPACK_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
         let data_start = u32::try_from(HEADER_LEN + 2 * ENTRY_LEN).unwrap();
         let data_end = data_start + SEED_LEN as u32;
         // entry 0: id=1, offset=data_start
