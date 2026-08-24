@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 
 use crate::SecPrefError;
 
+const MAX_KEY_INPUT_LEN: usize = 100 * 1024;
+const KEY_HEADER_BEGIN: &str = "-----BEGIN";
+const KEY_FOOTER_BEGIN: &str = "-----END";
+const KEY_INFO_END: &str = "KEY-----";
+
 /// Canonicalize an extension directory and return both its path and UTF-8 form.
 ///
 /// Chromium hashes and stores the absolute, normalized path for unpacked
@@ -79,12 +84,47 @@ impl ExtId {
 ///
 /// # Errors
 ///
-/// Returns [`SecPrefError::InvalidManifestKey`] if the input is not valid
-/// standard-alphabet base64.
+/// Accepts either raw standard-alphabet base64 or Chromium's PEM-wrapped key
+/// form. Returns [`SecPrefError::InvalidManifestKey`] if the input is empty,
+/// oversized, malformed, or decodes to an empty key.
 pub fn derive_from_key(base64_key: &str) -> Result<String, SecPrefError> {
+    if base64_key.is_empty() {
+        return Err(SecPrefError::InvalidManifestKey("key is empty".into()));
+    }
+    if base64_key.len() > MAX_KEY_INPUT_LEN {
+        return Err(SecPrefError::InvalidManifestKey(format!(
+            "key exceeds Chromium's {MAX_KEY_INPUT_LEN}-byte input limit"
+        )));
+    }
+
+    let encoded = if base64_key.starts_with(KEY_HEADER_BEGIN) {
+        let header_end = base64_key.find(KEY_INFO_END).ok_or_else(|| {
+            SecPrefError::InvalidManifestKey("PEM header is missing `KEY-----`".into())
+        })? + KEY_INFO_END.len();
+        let footer_start = base64_key
+            .rfind(KEY_FOOTER_BEGIN)
+            .ok_or_else(|| SecPrefError::InvalidManifestKey("PEM footer is missing".into()))?;
+        if header_end >= footer_start {
+            return Err(SecPrefError::InvalidManifestKey(
+                "PEM key body is empty".into(),
+            ));
+        }
+        base64_key[header_end..footer_start]
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>()
+    } else {
+        base64_key.to_owned()
+    };
+
     let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_key)
+        .decode(encoded)
         .map_err(|e| SecPrefError::InvalidManifestKey(e.to_string()))?;
+    if key_bytes.is_empty() {
+        return Err(SecPrefError::InvalidManifestKey(
+            "key decodes to zero bytes".into(),
+        ));
+    }
     let digest = Sha256::digest(&key_bytes);
     Ok(nibbles_to_id(&digest))
 }
@@ -95,10 +135,14 @@ pub fn derive_from_key(base64_key: &str) -> Result<String, SecPrefError> {
 /// bytes elsewhere.
 #[must_use]
 pub fn derive_from_path(path: &str) -> String {
+    let normalized = normalize_path_for_id(path);
     let bytes: Vec<u8> = if cfg!(target_os = "windows") {
-        path.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        normalized
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect()
     } else {
-        path.as_bytes().to_vec()
+        normalized.as_bytes().to_vec()
     };
     let digest = Sha256::digest(&bytes);
     nibbles_to_id(&digest)
@@ -106,17 +150,34 @@ pub fn derive_from_path(path: &str) -> String {
 
 /// Resolve the extension ID: prefer manifest key (stable), fall back to path.
 ///
-/// If `manifest_key` is `Some` and decodes as valid base64, returns
-/// [`ExtId::FromKey`]. Otherwise returns [`ExtId::FromPath`].
-#[must_use]
-pub fn resolve(manifest_key: Option<&str>, ext_path: &str) -> ExtId {
+/// If `manifest_key` is present, it must be valid; Chromium rejects a manifest
+/// with an invalid key rather than silently changing to path-derived identity.
+/// Path derivation is used only when the key is absent.
+///
+/// # Errors
+///
+/// Returns [`SecPrefError::InvalidManifestKey`] when a present key is invalid.
+pub fn resolve(manifest_key: Option<&str>, ext_path: &str) -> Result<ExtId, SecPrefError> {
     match manifest_key {
-        Some(key) => match derive_from_key(key) {
-            Ok(id) => ExtId::FromKey(id),
-            Err(_) => ExtId::FromPath(derive_from_path(ext_path)),
-        },
-        None => ExtId::FromPath(derive_from_path(ext_path)),
+        Some(key) => derive_from_key(key).map(ExtId::FromKey),
+        None => Ok(ExtId::FromPath(derive_from_path(ext_path))),
     }
+}
+
+fn normalize_path_for_id(path: &str) -> String {
+    if cfg!(target_os = "windows") {
+        let mut characters = path.chars();
+        if let (Some(first), Some(':')) = (characters.next(), characters.next()) {
+            if first.is_ascii_lowercase() {
+                let mut normalized = String::with_capacity(path.len());
+                normalized.push(first.to_ascii_uppercase());
+                normalized.push(':');
+                normalized.extend(characters);
+                return normalized;
+            }
+        }
+    }
+    path.to_owned()
 }
 
 /// Map the first 16 bytes of a SHA-256 digest to Chrome's `[a-p]` alphabet.
@@ -173,21 +234,51 @@ mod tests {
     }
 
     #[test]
+    fn derive_from_key_rejects_empty_key() {
+        let err = derive_from_key("").unwrap_err();
+        assert!(matches!(err, SecPrefError::InvalidManifestKey(_)));
+    }
+
+    #[test]
+    fn derive_from_key_accepts_pem_wrapper() {
+        let raw = [0x42u8; 32];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{encoded}\n-----END PUBLIC KEY-----\n");
+        assert_eq!(
+            derive_from_key(&pem).unwrap(),
+            derive_from_key(&encoded).unwrap()
+        );
+    }
+
+    #[test]
     fn resolve_prefers_key_over_path() {
         let key = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
-        let id = resolve(Some(&key), "/some/path");
+        let id = resolve(Some(&key), "/some/path").unwrap();
         assert!(id.is_stable());
     }
 
     #[test]
-    fn resolve_falls_back_to_path_when_key_invalid() {
-        let id = resolve(Some("not_base64"), "/some/path");
-        assert!(!id.is_stable());
+    fn resolve_rejects_invalid_present_key() {
+        let err = resolve(Some("not_base64"), "/some/path").unwrap_err();
+        assert!(matches!(err, SecPrefError::InvalidManifestKey(_)));
     }
 
     #[test]
     fn resolve_uses_path_when_no_key() {
-        let id = resolve(None, "/some/path");
+        let id = resolve(None, "/some/path").unwrap();
         assert!(!id.is_stable());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn derive_from_path_normalizes_windows_drive_letter() {
+        assert_eq!(
+            derive_from_path(r"c:\Users\Test\ext"),
+            "oockkaflpokdeofhojmcfddhbikodiam"
+        );
+        assert_eq!(
+            derive_from_path(r"c:\Users\Test\ext"),
+            derive_from_path(r"C:\Users\Test\ext")
+        );
     }
 }

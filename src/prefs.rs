@@ -19,13 +19,13 @@
 //!
 //! let m = manifest::parse(Path::new("/path/to/ext")).unwrap();
 //! let ext_path = "/path/to/ext";
-//! let ext_id = resolve_ext_id(m.key.as_deref(), ext_path).into_id();
+//! let ext_id = resolve_ext_id(m.key.as_deref(), ext_path).unwrap().into_id();
 //! let settings = manifest::build_default_settings(&m, ext_path);
 //!
 //! prefs::add_extension(&mut prefs_json, &ext_id, settings, &seed, sid).unwrap();
-//! prefs::enable_developer_mode(&mut prefs_json, &seed, sid);
-//! prefs::strip_encrypted_hashes(&mut prefs_json);
-//! prefs::recompute_super_mac(&mut prefs_json, &seed, sid);
+//! prefs::enable_developer_mode(&mut prefs_json, &seed, sid).unwrap();
+//! prefs::strip_encrypted_hashes(&mut prefs_json).unwrap();
+//! prefs::recompute_super_mac(&mut prefs_json, &seed, sid).unwrap();
 //!
 //! let output = serde_json::to_string(&prefs_json).unwrap();
 //! std::fs::write("Secure Preferences", output).unwrap();
@@ -96,16 +96,21 @@ pub fn add_extension(
     device_id: &str,
 ) -> Result<String, SecPrefError> {
     require_object(prefs_json, "$")?;
+    validate_object_path(prefs_json, &["extensions", "settings"])?;
+    validate_object_path(
+        prefs_json,
+        &["protection", "macs", "extensions", "settings"],
+    )?;
 
     let path = format!("extensions.settings.{ext_id}");
     let ext_mac = mac::compute_mac(seed, device_id, &path, &settings);
 
-    ensure_object(prefs_json, &["extensions", "settings"]).insert(ext_id.to_string(), settings);
+    ensure_object(prefs_json, &["extensions", "settings"])?.insert(ext_id.to_string(), settings);
 
     ensure_object(
         prefs_json,
         &["protection", "macs", "extensions", "settings"],
-    )
+    )?
     .insert(ext_id.to_string(), Value::String(ext_mac.clone()));
 
     Ok(ext_mac)
@@ -151,10 +156,29 @@ pub fn remove_extension(prefs_json: &mut Value, ext_id: &str) -> Result<(), SecP
 ///
 /// Required for unpacked / sideloaded extensions to load without a
 /// "developer mode" warning.
-pub fn enable_developer_mode(prefs_json: &mut Value, seed: &[u8], device_id: &str) {
-    ensure_object(prefs_json, &["extensions", "ui"])
+///
+/// # Errors
+///
+/// Returns [`SecPrefError::UnexpectedShape`] before making any change if an
+/// existing intermediate value is not an object.
+pub fn enable_developer_mode(
+    prefs_json: &mut Value,
+    seed: &[u8],
+    device_id: &str,
+) -> Result<(), SecPrefError> {
+    let paths: &[&[&str]] = &[
+        &["extensions", "ui"],
+        &["account_values", "extensions", "ui"],
+        &["protection", "macs", "extensions", "ui"],
+        &["protection", "macs", "account_values", "extensions", "ui"],
+    ];
+    for path in paths {
+        validate_object_path(prefs_json, path)?;
+    }
+
+    ensure_object(prefs_json, &["extensions", "ui"])?
         .insert("developer_mode".into(), Value::Bool(true));
-    ensure_object(prefs_json, &["account_values", "extensions", "ui"])
+    ensure_object(prefs_json, &["account_values", "extensions", "ui"])?
         .insert("developer_mode".into(), Value::Bool(true));
 
     let dev_mac = mac::compute_mac(
@@ -163,7 +187,7 @@ pub fn enable_developer_mode(prefs_json: &mut Value, seed: &[u8], device_id: &st
         "extensions.ui.developer_mode",
         &Value::Bool(true),
     );
-    ensure_object(prefs_json, &["protection", "macs", "extensions", "ui"])
+    ensure_object(prefs_json, &["protection", "macs", "extensions", "ui"])?
         .insert("developer_mode".into(), Value::String(dev_mac));
 
     let account_dev_mac = mac::compute_mac(
@@ -175,33 +199,62 @@ pub fn enable_developer_mode(prefs_json: &mut Value, seed: &[u8], device_id: &st
     ensure_object(
         prefs_json,
         &["protection", "macs", "account_values", "extensions", "ui"],
-    )
+    )?
     .insert("developer_mode".into(), Value::String(account_dev_mac));
+    Ok(())
 }
 
-/// Recursively remove every key that contains `"_encrypted_hash"`.
+/// Remove Chromium encrypted-integrity keys from the `protection` subtree.
 ///
 /// This can request Chromium's legacy-HMAC healing path on builds where that
 /// fallback remains enabled. It is not sufficient to prove that a browser will
 /// trust or retain the modified preference.
-pub fn strip_encrypted_hashes(value: &mut Value) {
+///
+/// Keys outside `protection` are never touched. Within `protection.macs`, only
+/// keys ending in `"_encrypted_hash"` are removed recursively; the top-level
+/// `protection.super_encrypted_hash` key is removed exactly.
+///
+/// # Errors
+///
+/// Returns [`SecPrefError::UnexpectedShape`] without changing the value if the
+/// root, `protection`, or `protection.macs` exists with the wrong JSON shape.
+pub fn strip_encrypted_hashes(value: &mut Value) -> Result<(), SecPrefError> {
+    require_object(value, "$")?;
+    validate_object_path(value, &["protection"])?;
+    validate_object_path(value, &["protection", "macs"])?;
+
+    let Some(protection) = value.get_mut("protection") else {
+        return Ok(());
+    };
+    let protection = protection
+        .as_object_mut()
+        .expect("validated protection object");
+    protection.swap_remove("super_encrypted_hash");
+
+    if let Some(macs) = protection.get_mut("macs") {
+        remove_encrypted_hash_keys(macs);
+    }
+    Ok(())
+}
+
+fn remove_encrypted_hash_keys(value: &mut Value) {
     match value {
         Value::Object(map) => {
             let keys_to_remove: Vec<String> = map
                 .keys()
-                .filter(|k| k.contains("_encrypted_hash"))
+                .filter(|key| key.ends_with("_encrypted_hash"))
                 .cloned()
                 .collect();
-            for k in &keys_to_remove {
-                map.swap_remove(k);
+            for key in &keys_to_remove {
+                map.swap_remove(key);
             }
-            for v in map.values_mut() {
-                strip_encrypted_hashes(v);
+            for nested in map.values_mut() {
+                remove_encrypted_hash_keys(nested);
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                strip_encrypted_hashes(item);
+                remove_encrypted_hash_keys(item);
             }
         }
         _ => {}
@@ -213,7 +266,20 @@ pub fn strip_encrypted_hashes(value: &mut Value) {
 ///
 /// Returns the fresh MAC (uppercase hex). Call this last, after every other
 /// mutation that touches `protection.macs`.
-pub fn recompute_super_mac(prefs_json: &mut Value, seed: &[u8], device_id: &str) -> String {
+///
+/// # Errors
+///
+/// Returns [`SecPrefError::UnexpectedShape`] before mutation when an existing
+/// `protection` or `protection.macs` value is not an object.
+pub fn recompute_super_mac(
+    prefs_json: &mut Value,
+    seed: &[u8],
+    device_id: &str,
+) -> Result<String, SecPrefError> {
+    require_object(prefs_json, "$")?;
+    validate_object_path(prefs_json, &["protection"])?;
+    validate_object_path(prefs_json, &["protection", "macs"])?;
+
     let macs = prefs_json
         .get("protection")
         .and_then(|p| p.get("macs"))
@@ -221,9 +287,9 @@ pub fn recompute_super_mac(prefs_json: &mut Value, seed: &[u8], device_id: &str)
         .unwrap_or_else(|| Value::Object(Map::new()));
 
     let super_mac = mac::compute_super_mac(seed, device_id, &macs);
-    ensure_object(prefs_json, &["protection"])
+    ensure_object(prefs_json, &["protection"])?
         .insert("super_mac".into(), Value::String(super_mac.clone()));
-    super_mac
+    Ok(super_mac)
 }
 
 /// Verify that a stored extension's MACs (per-value + `developer_mode` + super)
@@ -397,15 +463,53 @@ fn require_object(value: &Value, path: &str) -> Result<(), SecPrefError> {
 
 /// Navigate into nested objects, creating intermediate objects as needed.
 /// Returns a mutable reference to the innermost object's map.
-fn ensure_object<'a>(root: &'a mut Value, keys: &[&str]) -> &'a mut Map<String, Value> {
+fn validate_object_path(root: &Value, keys: &[&str]) -> Result<(), SecPrefError> {
+    require_object(root, "$")?;
     let mut current = root;
+    let mut traversed = Vec::with_capacity(keys.len());
     for &key in keys {
-        if !current.get(key).is_some_and(Value::is_object) {
+        traversed.push(key);
+        let Some(next) = current.get(key) else {
+            return Ok(());
+        };
+        if !next.is_object() {
+            return Err(SecPrefError::UnexpectedShape {
+                path: traversed.join("."),
+                reason: "expected object".into(),
+            });
+        }
+        current = next;
+    }
+    Ok(())
+}
+
+/// Navigate into nested objects, creating absent intermediate objects.
+/// Existing non-object values are rejected rather than overwritten.
+fn ensure_object<'a>(
+    root: &'a mut Value,
+    keys: &[&str],
+) -> Result<&'a mut Map<String, Value>, SecPrefError> {
+    let mut current = root;
+    let mut traversed = Vec::with_capacity(keys.len());
+    for &key in keys {
+        traversed.push(key);
+        if current.get(key).is_some_and(|value| !value.is_object()) {
+            return Err(SecPrefError::UnexpectedShape {
+                path: traversed.join("."),
+                reason: "expected object".into(),
+            });
+        }
+        if current.get(key).is_none() {
             current[key] = Value::Object(Map::new());
         }
         current = current.get_mut(key).expect("just created");
     }
-    current.as_object_mut().expect("guaranteed object")
+    current
+        .as_object_mut()
+        .ok_or_else(|| SecPrefError::UnexpectedShape {
+            path: traversed.join("."),
+            reason: "expected object".into(),
+        })
 }
 
 #[cfg(test)]
@@ -490,7 +594,7 @@ mod tests {
             },
             "keep_me": "yes"
         });
-        strip_encrypted_hashes(&mut v);
+        strip_encrypted_hashes(&mut v).unwrap();
         assert!(v.get("keep_me").is_some());
         assert!(v
             .get("protection")
@@ -506,6 +610,81 @@ mod tests {
     }
 
     #[test]
+    fn strip_encrypted_hashes_is_scoped_and_suffix_exact() {
+        let mut value = json!({
+            "outside_encrypted_hash": "preserve",
+            "protection": {
+                "super_encrypted_hash": "remove",
+                "macs": {
+                    "extensions": {
+                        "settings_encrypted_hash": "remove",
+                        "settings_encrypted_hash_backup": "preserve"
+                    }
+                }
+            }
+        });
+
+        strip_encrypted_hashes(&mut value).unwrap();
+
+        assert_eq!(value["outside_encrypted_hash"], "preserve");
+        assert!(value["protection"].get("super_encrypted_hash").is_none());
+        assert!(value["protection"]["macs"]["extensions"]
+            .get("settings_encrypted_hash")
+            .is_none());
+        assert_eq!(
+            value["protection"]["macs"]["extensions"]["settings_encrypted_hash_backup"],
+            "preserve"
+        );
+    }
+
+    #[test]
+    fn add_extension_rejects_wrong_shape_without_partial_mutation() {
+        let mut prefs = json!({"protection": {"macs": "invalid"}});
+        let original = prefs.clone();
+        let error = add_extension(
+            &mut prefs,
+            "abcdefghijklmnopqrstuvwxyzabcdef",
+            json!({"state": 1}),
+            &[0u8; 64],
+            "sid",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SecPrefError::UnexpectedShape { .. }));
+        assert_eq!(prefs, original);
+    }
+
+    #[test]
+    fn enable_developer_mode_rejects_wrong_shape_without_partial_mutation() {
+        let mut prefs = json!({"account_values": {"extensions": false}});
+        let original = prefs.clone();
+        let error = enable_developer_mode(&mut prefs, &[0u8; 64], "sid").unwrap_err();
+
+        assert!(matches!(error, SecPrefError::UnexpectedShape { .. }));
+        assert_eq!(prefs, original);
+    }
+
+    #[test]
+    fn recompute_super_mac_rejects_wrong_shape_without_mutation() {
+        let mut prefs = json!({"protection": false});
+        let original = prefs.clone();
+        let error = recompute_super_mac(&mut prefs, &[0u8; 64], "sid").unwrap_err();
+
+        assert!(matches!(error, SecPrefError::UnexpectedShape { .. }));
+        assert_eq!(prefs, original);
+    }
+
+    #[test]
+    fn strip_encrypted_hashes_rejects_wrong_shape_without_mutation() {
+        let mut prefs = json!({"protection": {"macs": false}});
+        let original = prefs.clone();
+        let error = strip_encrypted_hashes(&mut prefs).unwrap_err();
+
+        assert!(matches!(error, SecPrefError::UnexpectedShape { .. }));
+        assert_eq!(prefs, original);
+    }
+
+    #[test]
     fn recompute_super_mac_produces_stable_value() {
         let mut prefs = json!({});
         add_extension(
@@ -516,8 +695,8 @@ mod tests {
             "sid-42",
         )
         .unwrap();
-        let super_mac_a = recompute_super_mac(&mut prefs, &[7u8; 64], "sid-42");
-        let super_mac_b = recompute_super_mac(&mut prefs, &[7u8; 64], "sid-42");
+        let super_mac_a = recompute_super_mac(&mut prefs, &[7u8; 64], "sid-42").unwrap();
+        let super_mac_b = recompute_super_mac(&mut prefs, &[7u8; 64], "sid-42").unwrap();
         assert_eq!(super_mac_a, super_mac_b);
         assert_eq!(super_mac_a.len(), 64);
     }
@@ -537,9 +716,9 @@ mod tests {
             sid,
         )
         .unwrap();
-        enable_developer_mode(&mut prefs, &seed, sid);
-        strip_encrypted_hashes(&mut prefs);
-        recompute_super_mac(&mut prefs, &seed, sid);
+        enable_developer_mode(&mut prefs, &seed, sid).unwrap();
+        strip_encrypted_hashes(&mut prefs).unwrap();
+        recompute_super_mac(&mut prefs, &seed, sid).unwrap();
 
         let verdict = verify_extension(&prefs, ext_id, &seed, sid).unwrap();
         assert!(verdict.all_valid(), "verify_extension: {verdict:?}");
@@ -553,8 +732,8 @@ mod tests {
         let device_id = "S-1-5-21-1";
 
         add_extension(&mut prefs, ext_id, json!({"state": 1}), &seed, device_id).unwrap();
-        enable_developer_mode(&mut prefs, &seed, device_id);
-        recompute_super_mac(&mut prefs, &seed, device_id);
+        enable_developer_mode(&mut prefs, &seed, device_id).unwrap();
+        recompute_super_mac(&mut prefs, &seed, device_id).unwrap();
 
         prefs["extensions"]["ui"]["developer_mode"] = Value::Bool(false);
         let verdict = verify_extension(&prefs, ext_id, &seed, device_id).unwrap();

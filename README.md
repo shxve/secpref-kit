@@ -7,7 +7,9 @@ complete browser-aware tool and serves as the reference consumer.
 ## Capabilities
 
 - Compute per-value MACs and the top-level `super_mac`.
-- Parse DataPack v5 `resources.pak` files and extract `chrome_seed`.
+- Parse DataPack v5 `resources.pak` files and extract `chrome_seed` by the
+  build-matched `IDR_PREF_HASH_SEED_BIN` resource ID, or by a unique-candidate
+  compatibility check.
 - Canonicalize extension paths and derive extension IDs.
 - Parse manifests and build unpacked-extension settings.
 - Add, remove, list, and verify extension preference entries.
@@ -31,14 +33,14 @@ let path = "/absolute/path/to/extension";
 let manifest = manifest::parse_str(
     r#"{"manifest_version":3,"name":"Example","version":"1.0.0"}"#,
 )?;
-let id = resolve_ext_id(manifest.key.as_deref(), path).into_id();
+let id = resolve_ext_id(manifest.key.as_deref(), path)?.into_id();
 let settings = manifest::build_default_settings(&manifest, path);
 
 let mut data = serde_json::json!({});
 prefs::add_extension(&mut data, &id, settings, &seed, device_id)?;
-prefs::enable_developer_mode(&mut data, &seed, device_id);
-prefs::strip_encrypted_hashes(&mut data);
-prefs::recompute_super_mac(&mut data, &seed, device_id);
+prefs::enable_developer_mode(&mut data, &seed, device_id)?;
+prefs::strip_encrypted_hashes(&mut data)?;
+prefs::recompute_super_mac(&mut data, &seed, device_id)?;
 assert!(prefs::verify_extension(&data, &id, &seed, device_id)?.all_valid());
 # Ok::<(), secpref_kit::SecPrefError>(())
 ```

@@ -62,15 +62,18 @@
 //! let mut prefs_json: serde_json::Value = serde_json::from_str("{}").unwrap();
 //! let m = manifest::parse(Path::new("/path/to/ext")).unwrap();
 //! let ext_path = "/path/to/ext";
-//! let ext_id = secpref_kit::resolve_ext_id(m.key.as_deref(), ext_path).id().to_string();
+//! let ext_id = secpref_kit::resolve_ext_id(m.key.as_deref(), ext_path)
+//!     .unwrap()
+//!     .id()
+//!     .to_string();
 //! let settings = manifest::build_default_settings(&m, ext_path);
 //!
 //! let seed = [0u8; 64];
 //! let device_id = "S-1-5-21-...";
 //! prefs::add_extension(&mut prefs_json, &ext_id, settings, &seed, device_id).unwrap();
-//! prefs::enable_developer_mode(&mut prefs_json, &seed, device_id);
-//! prefs::strip_encrypted_hashes(&mut prefs_json);
-//! let _super_mac = prefs::recompute_super_mac(&mut prefs_json, &seed, device_id);
+//! prefs::enable_developer_mode(&mut prefs_json, &seed, device_id).unwrap();
+//! prefs::strip_encrypted_hashes(&mut prefs_json).unwrap();
+//! let _super_mac = prefs::recompute_super_mac(&mut prefs_json, &seed, device_id).unwrap();
 //! // Consumer now serialises `prefs_json` and writes it to disk atomically.
 //! ```
 //!
@@ -109,4 +112,7 @@ pub use ext_id::{
 };
 pub use mac::{canonicalize, compute_mac, compute_super_mac, strip_empties};
 pub use prefs::VerifyResult;
-pub use seed::{extract_seed_from_pak, extract_seed_from_pak_bytes, SEED_LEN};
+pub use seed::{
+    extract_seed_from_pak, extract_seed_from_pak_bytes, extract_seed_from_pak_resource,
+    extract_seed_from_pak_resource_bytes, SEED_LEN,
+};

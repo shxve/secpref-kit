@@ -1,16 +1,20 @@
 //! Extract `chrome_seed` from a Chromium `resources.pak`.
 //!
-//! Every Chromium build embeds a 64-byte HMAC seed inside `resources.pak`
-//! (`DataPack` v5 format). This module parses the pak header, walks the
-//! resource entries, and returns the first entry whose length is exactly
-//! [`SEED_LEN`] bytes.
+//! Branded Chromium builds embed a 64-byte HMAC seed as the named
+//! `IDR_PREF_HASH_SEED_BIN` resource in `resources.pak` (`DataPack` v5 format).
+//! Resource IDs are generated per build, so the exact extraction APIs require
+//! the caller to supply the ID from the matching generated resources header.
+//! Compatibility helpers accept a pak only when it contains exactly one
+//! 64-byte candidate; they reject ambiguous packs rather than choosing by
+//! table order.
 //!
 //! # Layout summary (`DataPack` v5)
 //!
 //! | Offset | Type  | Meaning                          |
 //! |-------:|-------|----------------------------------|
 //! | 0      | `u32` | version (must be 5)              |
-//! | 4      | `u32` | encoding (unused here)           |
+//! | 4      | `u8`  | encoding                         |
+//! | 5      | `[u8; 3]` | padding                     |
 //! | 8      | `u16` | `resource_count`                 |
 //! | 10     | `u16` | `alias_count`                    |
 //! | 12+    | `[u16 id, u32 offset]` × (`resource_count` + 1) | entry table with a sentinel |
@@ -42,20 +46,112 @@ const ALIAS_LEN: usize = 4; // u16 resource_id + u16 target resource index
 ///
 /// Returns [`SecPrefError::Io`] if the file cannot be read;
 /// [`SecPrefError::InvalidPak`] if the header is wrong or the file is
-/// truncated; [`SecPrefError::SeedNotFound`] if no 64-byte resource exists.
+/// truncated; [`SecPrefError::SeedNotFound`] if no 64-byte resource exists;
+/// [`SecPrefError::AmbiguousSeedCandidates`] if multiple candidates exist.
 pub fn extract_seed_from_pak(pak_path: impl AsRef<Path>) -> Result<Vec<u8>, SecPrefError> {
     let data = fs::read(pak_path)?;
     extract_seed_from_pak_bytes(&data)
 }
 
-/// Extract the seed given the raw bytes of a `resources.pak`.
+/// Extract the unique 64-byte seed candidate from raw `resources.pak` bytes.
 ///
-/// Useful for testing, or for callers that have already mapped the file.
+/// Prefer [`extract_seed_from_pak_resource_bytes`] when the matching Chromium
+/// resource ID is known. This compatibility helper never chooses the first of
+/// multiple candidates.
 ///
 /// # Errors
 ///
 /// Same as [`extract_seed_from_pak`] apart from I/O.
 pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError> {
+    let pack = parse_data_pack(data)?;
+    let candidates: Vec<&ResourceEntry> = pack
+        .resources
+        .iter()
+        .filter(|entry| entry.end - entry.offset == SEED_LEN)
+        .collect();
+    match candidates.as_slice() {
+        [] => Err(SecPrefError::SeedNotFound),
+        [entry] => Ok(data[entry.offset..entry.end].to_vec()),
+        _ => Err(SecPrefError::AmbiguousSeedCandidates(
+            candidates.iter().map(|entry| entry.id).collect(),
+        )),
+    }
+}
+
+/// Read Chromium's named preference-hash seed from a pak on disk.
+///
+/// `resource_id` must be the `IDR_PREF_HASH_SEED_BIN` value generated for the
+/// exact target build.
+///
+/// # Errors
+///
+/// Returns an I/O error, a `DataPack` validation error,
+/// [`SecPrefError::SeedResourceNotFound`], or
+/// [`SecPrefError::InvalidSeedLength`].
+pub fn extract_seed_from_pak_resource(
+    pak_path: impl AsRef<Path>,
+    resource_id: u16,
+) -> Result<Vec<u8>, SecPrefError> {
+    let data = fs::read(pak_path)?;
+    extract_seed_from_pak_resource_bytes(&data, resource_id)
+}
+
+/// Extract Chromium's named preference-hash seed from raw pak bytes.
+///
+/// Resolves both direct `DataPack` entries and aliases. `resource_id` must be the
+/// `IDR_PREF_HASH_SEED_BIN` value generated for the exact target build.
+///
+/// # Errors
+///
+/// Returns a `DataPack` validation error,
+/// [`SecPrefError::SeedResourceNotFound`], or
+/// [`SecPrefError::InvalidSeedLength`].
+pub fn extract_seed_from_pak_resource_bytes(
+    data: &[u8],
+    resource_id: u16,
+) -> Result<Vec<u8>, SecPrefError> {
+    let pack = parse_data_pack(data)?;
+    let entry = pack
+        .resources
+        .iter()
+        .find(|entry| entry.id == resource_id)
+        .or_else(|| {
+            pack.aliases
+                .iter()
+                .find(|alias| alias.id == resource_id)
+                .and_then(|alias| pack.resources.get(alias.target_index))
+        })
+        .ok_or(SecPrefError::SeedResourceNotFound(resource_id))?;
+    let length = entry.end - entry.offset;
+    if length != SEED_LEN {
+        return Err(SecPrefError::InvalidSeedLength {
+            resource_id,
+            actual: length,
+        });
+    }
+    Ok(data[entry.offset..entry.end].to_vec())
+}
+
+#[derive(Debug)]
+struct DataPack {
+    resources: Vec<ResourceEntry>,
+    aliases: Vec<AliasEntry>,
+}
+
+#[derive(Debug)]
+struct ResourceEntry {
+    id: u16,
+    offset: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct AliasEntry {
+    id: u16,
+    target_index: usize,
+}
+
+fn parse_data_pack(data: &[u8]) -> Result<DataPack, SecPrefError> {
     if data.len() < HEADER_LEN {
         return Err(SecPrefError::InvalidPak(
             "resources.pak too small for DataPack v5 header".into(),
@@ -69,7 +165,7 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
         )));
     }
 
-    let encoding = u32::from_le_bytes(data[4..8].try_into().expect("checked len ≥ 12"));
+    let encoding = data[4];
     if encoding > 2 {
         return Err(SecPrefError::InvalidPak(format!(
             "invalid DataPack encoding {encoding}"
@@ -101,8 +197,14 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
         ));
     }
 
+    let mut resources = Vec::with_capacity(resource_count);
     for i in 0..resource_count {
         let base = HEADER_LEN + i * ENTRY_LEN;
+        let id = u16::from_le_bytes(
+            data[base..base + 2]
+                .try_into()
+                .expect("bounded by entries_bytes"),
+        );
         let offset = u32::from_le_bytes(
             data[base + 2..base + 6]
                 .try_into()
@@ -131,13 +233,57 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
             ));
         }
 
-        let len = next_offset - offset;
-        if len == SEED_LEN {
-            return Ok(data[offset..next_offset].to_vec());
+        if resources.iter().any(|entry: &ResourceEntry| entry.id == id) {
+            return Err(SecPrefError::InvalidPak(format!(
+                "duplicate resource ID {id}"
+            )));
         }
+        resources.push(ResourceEntry {
+            id,
+            offset,
+            end: next_offset,
+        });
     }
 
-    Err(SecPrefError::SeedNotFound)
+    let aliases = parse_aliases(data, HEADER_LEN + entries_bytes, alias_count, &resources)?;
+
+    Ok(DataPack { resources, aliases })
+}
+
+fn parse_aliases(
+    data: &[u8],
+    alias_start: usize,
+    alias_count: usize,
+    resources: &[ResourceEntry],
+) -> Result<Vec<AliasEntry>, SecPrefError> {
+    let mut aliases = Vec::with_capacity(alias_count);
+    for i in 0..alias_count {
+        let base = alias_start + i * ALIAS_LEN;
+        let id = u16::from_le_bytes(
+            data[base..base + 2]
+                .try_into()
+                .expect("bounded by alias_bytes"),
+        );
+        let target_index = u16::from_le_bytes(
+            data[base + 2..base + 4]
+                .try_into()
+                .expect("bounded by alias_bytes"),
+        ) as usize;
+        if target_index >= resources.len() {
+            return Err(SecPrefError::InvalidPak(format!(
+                "alias resource {id} targets missing entry index {target_index}"
+            )));
+        }
+        if resources.iter().any(|entry| entry.id == id)
+            || aliases.iter().any(|alias: &AliasEntry| alias.id == id)
+        {
+            return Err(SecPrefError::InvalidPak(format!(
+                "duplicate resource or alias ID {id}"
+            )));
+        }
+        aliases.push(AliasEntry { id, target_index });
+    }
+    Ok(aliases)
 }
 
 // Compatibility with older names — some downstream consumers use these.
@@ -153,26 +299,35 @@ pub fn extract_seed(pak_path: &Path) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Build a minimal synthetic `DataPack` v5 containing a single 64-byte
-    /// resource. Used to unit-test the extractor without a real Chromium pak.
     #[allow(clippy::cast_possible_truncation)]
-    fn synthetic_pak_with_seed(seed: &[u8; SEED_LEN]) -> Vec<u8> {
+    fn synthetic_pak(resources: &[(u16, &[u8])], aliases: &[(u16, u16)]) -> Vec<u8> {
         let mut buf = Vec::new();
-        // DataPack v5 header followed by two entries (one resource + sentinel).
         buf.extend_from_slice(&DATAPACK_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&(resources.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(aliases.len() as u16).to_le_bytes());
+
+        let mut offset =
+            (HEADER_LEN + (resources.len() + 1) * ENTRY_LEN + aliases.len() * ALIAS_LEN) as u32;
+        for (id, payload) in resources {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+            offset += payload.len() as u32;
+        }
         buf.extend_from_slice(&0u16.to_le_bytes());
-        let data_start = u32::try_from(HEADER_LEN + 2 * ENTRY_LEN).unwrap();
-        let data_end = data_start + SEED_LEN as u32;
-        // entry 0: id=1, offset=data_start
-        buf.extend_from_slice(&1u16.to_le_bytes());
-        buf.extend_from_slice(&data_start.to_le_bytes());
-        // sentinel: id=0, offset=data_end
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&data_end.to_le_bytes());
-        buf.extend_from_slice(seed);
+        buf.extend_from_slice(&offset.to_le_bytes());
+        for (id, target_index) in aliases {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&target_index.to_le_bytes());
+        }
+        for (_, payload) in resources {
+            buf.extend_from_slice(payload);
+        }
         buf
+    }
+
+    fn synthetic_pak_with_seed(seed: &[u8; SEED_LEN]) -> Vec<u8> {
+        synthetic_pak(&[(1, seed)], &[])
     }
 
     #[test]
@@ -181,6 +336,35 @@ mod tests {
         let pak = synthetic_pak_with_seed(&seed);
         let recovered = extract_seed_from_pak_bytes(&pak).unwrap();
         assert_eq!(recovered, seed);
+    }
+
+    #[test]
+    fn rejects_ambiguous_length_only_seed_selection() {
+        let first = [0x11; SEED_LEN];
+        let second = [0x22; SEED_LEN];
+        let pak = synthetic_pak(&[(10, &first), (20, &second)], &[]);
+
+        let error = extract_seed_from_pak_bytes(&pak).unwrap_err();
+        assert!(matches!(
+            error,
+            SecPrefError::AmbiguousSeedCandidates(ids) if ids == vec![10, 20]
+        ));
+    }
+
+    #[test]
+    fn extracts_exact_named_resource_and_alias() {
+        let unrelated = [0x11; SEED_LEN];
+        let seed = [0x22; SEED_LEN];
+        let pak = synthetic_pak(&[(10, &unrelated), (20, &seed)], &[(30, 1)]);
+
+        assert_eq!(
+            extract_seed_from_pak_resource_bytes(&pak, 20).unwrap(),
+            seed
+        );
+        assert_eq!(
+            extract_seed_from_pak_resource_bytes(&pak, 30).unwrap(),
+            seed
+        );
     }
 
     #[test]
@@ -205,6 +389,15 @@ mod tests {
         pak[4..8].copy_from_slice(&3u32.to_le_bytes());
         let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
         assert!(matches!(err, SecPrefError::InvalidPak(_)));
+    }
+
+    #[test]
+    fn ignores_v5_header_padding_bytes() {
+        let seed = [0xAB; SEED_LEN];
+        let mut pak = synthetic_pak_with_seed(&seed);
+        pak[5..8].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        assert_eq!(extract_seed_from_pak_bytes(&pak).unwrap(), seed);
     }
 
     #[test]

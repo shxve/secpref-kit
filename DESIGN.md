@@ -27,7 +27,9 @@ browser-aware consumer.
 2. Extension paths are canonicalized once and the same UTF-8 representation is
    used for manifest access, ID derivation, and stored settings.
 3. DataPack parsing validates the encoding, entry table, alias table, monotonic
-   offsets, and file bounds before slicing.
+   offsets, and file bounds before slicing. Exact seed extraction requires the
+   build-matched `IDR_PREF_HASH_SEED_BIN` resource ID and resolves aliases;
+   length-only compatibility extraction rejects multiple 64-byte candidates.
 4. Verification recomputes MACs from the values actually stored. It checks the
    extension, both developer-mode mirrors, and the super-MAC independently.
 5. Encrypted hashes may be removed before the super-MAC is recomputed to request
@@ -35,6 +37,14 @@ browser-aware consumer.
    legacy self-check is not browser acceptance.
 6. The Windows device ID follows Chromium: obtain the computer name, resolve it
    with `LookupAccountNameW`, and stringify the resulting machine SID.
+7. A present invalid manifest key is an error, never a path-ID fallback. Raw
+   base64 and Chromium-style PEM wrappers are accepted; empty keys are rejected.
+8. Preference mutation preflights every affected object path and rejects wrong
+   shapes before writing. Encrypted-hash removal is confined to the integrity
+   subtree and matches Chromium's `_encrypted_hash` suffix.
+9. Manifest permission arrays are shape-checked. MV2 URL-pattern permissions
+   are separated into the explicit-host bucket; unsupported parameterized
+   dictionary permissions are rejected instead of silently discarded.
 
 ## API and build policy
 
@@ -43,8 +53,9 @@ browser-aware consumer.
 - Errors and externally consumed info types are non-exhaustive.
 - The crate is library-only; it carries no command parser or filesystem write
   policy.
-- MSRV is Rust 1.85, matching the resolved dependency floor. Dependency
-  resolution remains the consuming application's responsibility.
+- MSRV is Rust 1.85, matching the resolved dependency floor and exercised by
+  CI alongside stable on Ubuntu and Windows. Dependency resolution remains the
+  consuming application's responsibility.
 - Unsafe code is confined to the Windows SID module and wrapped by safe APIs.
 
 ## Consumer relationship

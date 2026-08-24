@@ -1,6 +1,5 @@
 //! Extension-ID derivation coverage.
 
-#[cfg(not(target_os = "windows"))]
 use secpref_kit::derive_from_path;
 use secpref_kit::{derive_from_key, resolve_ext_id, ExtId};
 
@@ -23,6 +22,19 @@ fn from_path_linux_matches_pinned_vector() {
 }
 
 #[test]
+#[cfg(target_os = "windows")]
+fn from_path_windows_normalizes_drive_and_matches_pinned_vector() {
+    assert_eq!(
+        derive_from_path(r"c:\Users\Test\ext"),
+        "oockkaflpokdeofhojmcfddhbikodiam"
+    );
+    assert_eq!(
+        derive_from_path(r"c:\Users\Test\ext"),
+        derive_from_path(r"C:\Users\Test\ext")
+    );
+}
+
+#[test]
 fn from_key_rejects_non_base64() {
     let err = derive_from_key("!!!not base64!!!").unwrap_err();
     assert!(matches!(
@@ -32,9 +44,28 @@ fn from_key_rejects_non_base64() {
 }
 
 #[test]
+fn from_key_rejects_empty_input() {
+    let error = derive_from_key("").unwrap_err();
+    assert!(matches!(
+        error,
+        secpref_kit::SecPrefError::InvalidManifestKey(_)
+    ));
+}
+
+#[test]
+fn from_key_accepts_pem_wrapper() {
+    let encoded = base64_encode_zeros(64);
+    let pem = format!("-----BEGIN PUBLIC KEY-----\n{encoded}\n-----END PUBLIC KEY-----");
+    assert_eq!(
+        derive_from_key(&pem).unwrap(),
+        derive_from_key(&encoded).unwrap()
+    );
+}
+
+#[test]
 fn resolve_prefers_valid_key() {
     let key = base64_encode_zeros(64);
-    let ext_id = resolve_ext_id(Some(&key), "/whatever/path");
+    let ext_id = resolve_ext_id(Some(&key), "/whatever/path").unwrap();
     match ext_id {
         ExtId::FromKey(_) => {}
         ExtId::FromPath(_) => panic!("should have used the manifest key"),
@@ -42,14 +73,17 @@ fn resolve_prefers_valid_key() {
 }
 
 #[test]
-fn resolve_falls_back_to_path_when_key_invalid() {
-    let ext_id = resolve_ext_id(Some("not-base64!!!"), "/some/path");
-    assert!(matches!(ext_id, ExtId::FromPath(_)));
+fn resolve_rejects_invalid_present_key() {
+    let error = resolve_ext_id(Some("not-base64!!!"), "/some/path").unwrap_err();
+    assert!(matches!(
+        error,
+        secpref_kit::SecPrefError::InvalidManifestKey(_)
+    ));
 }
 
 #[test]
 fn resolve_uses_path_when_no_key() {
-    let ext_id = resolve_ext_id(None, "/some/path");
+    let ext_id = resolve_ext_id(None, "/some/path").unwrap();
     assert!(matches!(ext_id, ExtId::FromPath(_)));
 }
 

@@ -15,16 +15,18 @@ fn install_flow_produces_valid_macs() {
         manifest::parse_str(r#"{"manifest_version": 3, "name": "Test", "version": "0.1.0", "permissions": ["cookies"]}"#)
             .unwrap();
     let ext_path = "/tmp/some/ext";
-    let ext_id = resolve_ext_id(m.key.as_deref(), ext_path).into_id();
+    let ext_id = resolve_ext_id(m.key.as_deref(), ext_path)
+        .unwrap()
+        .into_id();
     let settings = manifest::build_default_settings(&m, ext_path);
 
     // Install + developer mode + encrypted-hash bypass + super-MAC.
     let ext_mac = prefs::add_extension(&mut prefs_json, &ext_id, settings, &SEED, SID).unwrap();
     assert_eq!(ext_mac.len(), 64);
 
-    prefs::enable_developer_mode(&mut prefs_json, &SEED, SID);
-    prefs::strip_encrypted_hashes(&mut prefs_json);
-    let super_mac = prefs::recompute_super_mac(&mut prefs_json, &SEED, SID);
+    prefs::enable_developer_mode(&mut prefs_json, &SEED, SID).unwrap();
+    prefs::strip_encrypted_hashes(&mut prefs_json).unwrap();
+    let super_mac = prefs::recompute_super_mac(&mut prefs_json, &SEED, SID).unwrap();
     assert_eq!(super_mac.len(), 64);
 
     // Verify.
@@ -40,8 +42,8 @@ fn tampered_extension_fails_verify() {
     let mut prefs_json = json!({});
     let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
     prefs::add_extension(&mut prefs_json, ext_id, json!({"state": 1}), &SEED, SID).unwrap();
-    prefs::enable_developer_mode(&mut prefs_json, &SEED, SID);
-    prefs::recompute_super_mac(&mut prefs_json, &SEED, SID);
+    prefs::enable_developer_mode(&mut prefs_json, &SEED, SID).unwrap();
+    prefs::recompute_super_mac(&mut prefs_json, &SEED, SID).unwrap();
 
     // Tamper: change the settings blob without recomputing the MAC.
     if let Some(s) = prefs_json

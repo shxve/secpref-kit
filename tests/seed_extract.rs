@@ -2,7 +2,9 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
-use secpref_kit::{extract_seed_from_pak_bytes, SecPrefError, SEED_LEN};
+use secpref_kit::{
+    extract_seed_from_pak_bytes, extract_seed_from_pak_resource_bytes, SecPrefError, SEED_LEN,
+};
 
 const HEADER_LEN: usize = 12;
 const ENTRY_LEN: usize = 6;
@@ -30,6 +32,22 @@ fn extracts_64_byte_seed_from_single_resource() {
     let pak = synthetic_pak_with_resource(&seed);
     let out = extract_seed_from_pak_bytes(&pak).unwrap();
     assert_eq!(out, seed);
+}
+
+#[test]
+fn extracts_seed_by_exact_resource_id() {
+    let seed = [0xC3u8; SEED_LEN];
+    let pak = synthetic_pak_with_resource(&seed);
+    let out = extract_seed_from_pak_resource_bytes(&pak, 1).unwrap();
+    assert_eq!(out, seed);
+}
+
+#[test]
+fn exact_resource_id_must_exist() {
+    let seed = [0xC3u8; SEED_LEN];
+    let pak = synthetic_pak_with_resource(&seed);
+    let error = extract_seed_from_pak_resource_bytes(&pak, 99).unwrap_err();
+    assert!(matches!(error, SecPrefError::SeedResourceNotFound(99)));
 }
 
 #[test]

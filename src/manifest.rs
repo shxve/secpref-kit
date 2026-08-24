@@ -26,11 +26,15 @@ const FILETIME_EPOCH_OFFSET_US: u64 = 11_644_473_600_000_000;
 pub struct Manifest {
     /// The raw parsed JSON of `manifest.json`.
     pub raw: Value,
+    /// Chromium manifest version (`2` or `3`).
+    pub manifest_version: u64,
     /// The extension name.
     pub name: String,
     /// The extension version.
     pub version: String,
-    /// Requested API permissions (`permissions` field).
+    /// Requested permission strings from the `permissions` field. This may
+    /// include Manifest V2 host patterns, which settings construction separates
+    /// from API permissions.
     pub permissions: Vec<String>,
     /// Requested host permissions (`host_permissions` field).
     pub host_permissions: Vec<String>,
@@ -77,6 +81,11 @@ pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
             "unsupported `manifest_version` {manifest_version}"
         )));
     }
+    if manifest_version == 2 && raw.get("host_permissions").is_some() {
+        return Err(SecPrefError::InvalidManifest(
+            "`host_permissions` is available only in Manifest V3".into(),
+        ));
+    }
 
     let name = raw
         .get("name")
@@ -92,10 +101,18 @@ pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
         .ok_or_else(|| SecPrefError::InvalidManifest("missing non-empty string `version`".into()))?
         .to_string();
 
-    let permissions = extract_string_array(&raw, "permissions");
-    let host_permissions = extract_string_array(&raw, "host_permissions");
+    let permissions = extract_string_array(&raw, "permissions")?;
+    let host_permissions = extract_string_array(&raw, "host_permissions")?;
 
-    let key = raw.get("key").and_then(Value::as_str).map(String::from);
+    let key = match raw.get("key") {
+        Some(Value::String(key)) => Some(key.clone()),
+        Some(_) => {
+            return Err(SecPrefError::InvalidManifest(
+                "`key` must be a string".into(),
+            ));
+        }
+        None => None,
+    };
 
     let service_worker = raw
         .get("background")
@@ -105,6 +122,7 @@ pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
 
     Ok(Manifest {
         raw,
+        manifest_version,
         name,
         version,
         permissions,
@@ -125,22 +143,25 @@ pub fn parse_str(json_str: &str) -> Result<Manifest, SecPrefError> {
 pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
     let now = filetime_now();
 
-    let all_permissions: Vec<Value> = manifest
+    let api_permissions: Vec<Value> = manifest
         .permissions
         .iter()
+        .filter(|permission| !is_host_permission(permission))
         .map(|s| Value::String(s.clone()))
         .collect();
 
-    let all_hosts: Vec<Value> = manifest
-        .host_permissions
+    let explicit_hosts: Vec<Value> = manifest
+        .permissions
         .iter()
+        .filter(|permission| is_host_permission(permission))
+        .chain(manifest.host_permissions.iter())
         .map(|s| Value::String(s.clone()))
         .collect();
 
     json!({
         "active_permissions": {
-            "api": all_permissions,
-            "explicit_host": all_hosts,
+            "api": api_permissions,
+            "explicit_host": explicit_hosts,
             "manifest_permissions": [],
             "scriptable_host": []
         },
@@ -151,8 +172,8 @@ pub fn build_default_settings(manifest: &Manifest, ext_path: &str) -> Value {
         "first_install_time": now,
         "from_webstore": false,
         "granted_permissions": {
-            "api": all_permissions,
-            "explicit_host": all_hosts,
+            "api": api_permissions,
+            "explicit_host": explicit_hosts,
             "manifest_permissions": [],
             "scriptable_host": []
         },
@@ -179,17 +200,28 @@ fn filetime_now() -> String {
     filetime.to_string()
 }
 
-fn extract_string_array(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
+fn extract_string_array(value: &Value, key: &str) -> Result<Vec<String>, SecPrefError> {
+    let Some(raw) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    let array = raw
+        .as_array()
+        .ok_or_else(|| SecPrefError::InvalidManifest(format!("`{key}` must be an array")))?;
+    array
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry.as_str().map(String::from).ok_or_else(|| {
+                SecPrefError::InvalidManifest(format!(
+                    "`{key}[{index}]` must be a string; parameterized dictionary permissions are not supported"
+                ))
+            })
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn is_host_permission(permission: &str) -> bool {
+    permission == "<all_urls>" || permission.contains("://")
 }
 
 #[cfg(test)]
@@ -202,6 +234,7 @@ mod tests {
         let m = parse_str(json).unwrap();
         assert_eq!(m.name, "Hello");
         assert_eq!(m.version, "1.2.3");
+        assert_eq!(m.manifest_version, 3);
         assert_eq!(m.permissions, vec!["cookies".to_string()]);
         assert!(m.key.is_none());
         assert!(m.service_worker.is_none());
@@ -240,5 +273,45 @@ mod tests {
             parse_str(r#"{"manifest_version":3,"name":"","version":"1"}"#),
             Err(SecPrefError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_permission_entries_instead_of_dropping_them() {
+        let error = parse_str(
+            r#"{"manifest_version":3,"name":"N","version":"1","permissions":["tabs",42]}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SecPrefError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn rejects_non_string_manifest_key() {
+        let error =
+            parse_str(r#"{"manifest_version":3,"name":"N","version":"1","key":42}"#).unwrap_err();
+        assert!(matches!(error, SecPrefError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn rejects_mv2_host_permissions_field() {
+        let error = parse_str(
+            r#"{"manifest_version":2,"name":"N","version":"1","host_permissions":["https://example.test/*"]}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SecPrefError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn mv2_host_patterns_are_written_as_explicit_hosts() {
+        let manifest = parse_str(
+            r#"{"manifest_version":2,"name":"N","version":"1","permissions":["tabs","https://example.test/*","<all_urls>"]}"#,
+        )
+        .unwrap();
+        let settings = build_default_settings(&manifest, "/opt/ext");
+
+        assert_eq!(settings["active_permissions"]["api"], json!(["tabs"]));
+        assert_eq!(
+            settings["active_permissions"]["explicit_host"],
+            json!(["https://example.test/*", "<all_urls>"])
+        );
     }
 }
