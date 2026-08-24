@@ -24,6 +24,9 @@ browser-aware consumer.
 1. `serde_json` uses `preserve_order` to avoid gratuitously reordering the
    stored file. MAC input is separate: dictionary keys are sorted recursively,
    matching Chromium's `base::Value::Dict` semantics.
+   A preference absent from the document is represented by the explicit
+   `compute_absent_mac` API and contributes zero serialized-value bytes; it is
+   never approximated with JSON `null` or an empty string.
 2. Extension paths are canonicalized once and the same UTF-8 representation is
    used for manifest access, ID derivation, and stored settings.
 3. DataPack parsing validates the encoding, entry table, alias table, monotonic

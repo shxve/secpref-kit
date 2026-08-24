@@ -4,7 +4,7 @@
 //! serialisation, or hex encoding are caught by CI. Match Chromium's
 //! observed behaviour and the vectors used by upstream `Silent_Chrome`.
 
-use secpref_kit::{compute_mac, compute_super_mac};
+use secpref_kit::{compute_absent_mac, compute_absent_mac_bytes, compute_mac, compute_super_mac};
 use serde_json::{json, Value};
 
 #[test]
@@ -27,6 +27,39 @@ fn mac_object_value_with_seed_and_sid() {
     assert_eq!(
         mac,
         "B33251DEB592061EDBCE92A14F009D37181A0F9F5B64605CC01764E1CAE12471"
+    );
+}
+
+#[test]
+fn absent_preference_has_no_serialized_value_bytes() {
+    let mac = compute_absent_mac(b"", "", "missing.pref");
+    assert_eq!(
+        mac,
+        "7716107AF54B6DDD4A298E0E357ECB129C896C8DF706362730CC57277C685793"
+    );
+    assert_ne!(mac, compute_mac(b"", "", "missing.pref", &Value::Null));
+    assert_ne!(
+        mac,
+        compute_mac(b"", "", "missing.pref", &Value::String(String::new()))
+    );
+}
+
+#[test]
+fn absent_preference_raw_bytes_match_pinned_hex() {
+    let seed = [b'K'; 64];
+    let hex = compute_absent_mac(&seed, "S-1-5-21-123", "extensions.settings.absent");
+    let bytes = compute_absent_mac_bytes(&seed, "S-1-5-21-123", "extensions.settings.absent");
+    assert_eq!(
+        hex,
+        "EE99E5BC40BBBF69703914693BFBA4800B3E66C978F6A5A7BFF742930007C5AF"
+    );
+    assert_eq!(
+        bytes,
+        [
+            0xEE, 0x99, 0xE5, 0xBC, 0x40, 0xBB, 0xBF, 0x69, 0x70, 0x39, 0x14, 0x69, 0x3B, 0xFB,
+            0xA4, 0x80, 0x0B, 0x3E, 0x66, 0xC9, 0x78, 0xF6, 0xA5, 0xA7, 0xBF, 0xF7, 0x42, 0x93,
+            0x00, 0x07, 0xC5, 0xAF,
+        ]
     );
 }
 

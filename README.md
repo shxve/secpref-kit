@@ -6,7 +6,8 @@ complete browser-aware tool and serves as the reference consumer.
 
 ## Capabilities
 
-- Compute per-value MACs and the top-level `super_mac`.
+- Compute present-value MACs, explicit absent-preference MACs, and the top-level
+  `super_mac`.
 - Parse compact Chromium and wide-ID Edge DataPack v5 `resources.pak` files,
   then extract `chrome_seed` by the build-matched `IDR_PREF_HASH_SEED_BIN`
   resource ID or by a unique-candidate compatibility check.
@@ -21,6 +22,10 @@ CLI design, and write policy belong to consumers such as SilentChrome.
 `verify_extension` checks internal consistency of the legacy MAC family only.
 It does not validate encrypted hashes or establish that a current Chromium
 build will retain and activate a modified extension record.
+
+Chromium treats a preference absent from the JSON document differently from a
+present JSON `null` or empty string. Use `compute_absent_mac` (or
+`compute_absent_mac_bytes`) for that case; do not synthesize a JSON value.
 
 ## Library
 

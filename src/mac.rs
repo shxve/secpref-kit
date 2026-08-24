@@ -2,8 +2,10 @@
 //!
 //! Two MACs matter:
 //!
-//! 1. **Per-value MAC** ([`compute_mac`]): `HMAC-SHA256(seed, device_id || path || canonical(value))`
-//!    stored under `protection.macs.<dot-separated-path>`.
+//! 1. **Per-preference MAC** ([`compute_mac`] or [`compute_absent_mac`]):
+//!    `HMAC-SHA256(seed, device_id || path || serialized_value)` stored under
+//!    `protection.macs.<dot-separated-path>`. A preference absent from the JSON
+//!    document has zero serialized-value bytes.
 //! 2. **Super-MAC** ([`compute_super_mac`]): `HMAC-SHA256(seed, device_id || compact_json(macs))`
 //!    stored at `protection.super_mac`, covering the entire `protection.macs`
 //!    dictionary.
@@ -18,6 +20,9 @@
 //! escaped as `\u003C`.
 //! Get any of those wrong and the MAC will not match what the browser
 //! computes on load.
+//!
+//! Chromium distinguishes an absent preference from a present JSON `null` or
+//! empty string. Use [`compute_absent_mac`] only for the absent case.
 
 use std::fmt::Write;
 
@@ -50,8 +55,32 @@ type HmacSha256 = Hmac<Sha256>;
 #[must_use]
 pub fn compute_mac(seed: &[u8], device_id: &str, pref_path: &str, value: &Value) -> String {
     let canonical = canonicalize(value);
-    let message = format!("{device_id}{pref_path}{canonical}");
-    hmac_hex(seed, message.as_bytes())
+    pref_mac_hex(seed, device_id, pref_path, &canonical)
+}
+
+/// Compute a per-preference MAC for a preference absent from the JSON document.
+///
+/// `HMAC-SHA256(seed, device_id || pref_path)` → 64 uppercase hex characters.
+///
+/// Chromium represents a missing `base::Value*` as an empty serialized-value
+/// string. This is distinct from passing [`Value::Null`] to [`compute_mac`]
+/// (which appends the JSON bytes `null`) or passing an empty JSON string (which
+/// appends the bytes `""`).
+///
+/// # Examples
+///
+/// ```
+/// use secpref_kit::{compute_absent_mac, compute_mac};
+/// use serde_json::Value;
+///
+/// let absent = compute_absent_mac(b"", "", "missing.pref");
+/// let json_null = compute_mac(b"", "", "missing.pref", &Value::Null);
+/// assert_eq!(absent, "7716107AF54B6DDD4A298E0E357ECB129C896C8DF706362730CC57277C685793");
+/// assert_ne!(absent, json_null);
+/// ```
+#[must_use]
+pub fn compute_absent_mac(seed: &[u8], device_id: &str, pref_path: &str) -> String {
+    pref_mac_hex(seed, device_id, pref_path, "")
 }
 
 /// Compute the `super_mac` over the entire `protection.macs` sub-tree.
@@ -77,8 +106,15 @@ pub fn compute_super_mac(seed: &[u8], device_id: &str, macs: &Value) -> String {
 #[must_use]
 pub fn compute_mac_bytes(seed: &[u8], device_id: &str, pref_path: &str, value: &Value) -> [u8; 32] {
     let canonical = canonicalize(value);
-    let message = format!("{device_id}{pref_path}{canonical}");
-    hmac_bytes(seed, message.as_bytes())
+    pref_mac_bytes(seed, device_id, pref_path, &canonical)
+}
+
+/// Compute the absent-preference MAC as raw bytes (32 bytes).
+///
+/// This is the raw-byte counterpart of [`compute_absent_mac`].
+#[must_use]
+pub fn compute_absent_mac_bytes(seed: &[u8], device_id: &str, pref_path: &str) -> [u8; 32] {
+    pref_mac_bytes(seed, device_id, pref_path, "")
 }
 
 /// Compute the super-MAC as raw bytes (32 bytes).
@@ -174,6 +210,21 @@ fn sort_object_keys(value: &mut Value) {
     }
 }
 
+fn pref_mac_bytes(
+    seed: &[u8],
+    device_id: &str,
+    pref_path: &str,
+    serialized_value: &str,
+) -> [u8; 32] {
+    let message = format!("{device_id}{pref_path}{serialized_value}");
+    hmac_bytes(seed, message.as_bytes())
+}
+
+fn pref_mac_hex(seed: &[u8], device_id: &str, pref_path: &str, serialized_value: &str) -> String {
+    let message = format!("{device_id}{pref_path}{serialized_value}");
+    hmac_hex(seed, message.as_bytes())
+}
+
 fn hmac_bytes(seed: &[u8], message: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(seed).expect("HMAC accepts any key length");
     mac.update(message);
@@ -211,6 +262,47 @@ mod tests {
         assert_eq!(
             mac,
             "B33251DEB592061EDBCE92A14F009D37181A0F9F5B64605CC01764E1CAE12471"
+        );
+    }
+
+    #[test]
+    fn absent_mac_uses_zero_serialized_value_bytes() {
+        assert_eq!(
+            compute_absent_mac(b"", "", "missing.pref"),
+            "7716107AF54B6DDD4A298E0E357ECB129C896C8DF706362730CC57277C685793"
+        );
+    }
+
+    #[test]
+    fn absent_mac_differs_from_present_null_and_empty_string() {
+        let absent = compute_absent_mac(b"seed", "device", "missing.pref");
+        let json_null = compute_mac(b"seed", "device", "missing.pref", &Value::Null);
+        let empty_string = compute_mac(
+            b"seed",
+            "device",
+            "missing.pref",
+            &Value::String(String::new()),
+        );
+        assert_ne!(absent, json_null);
+        assert_ne!(absent, empty_string);
+    }
+
+    #[test]
+    fn absent_mac_bytes_match_hex() {
+        let hex = compute_absent_mac(&[b'K'; 64], "S-1-5-21-123", "extensions.settings.absent");
+        let bytes =
+            compute_absent_mac_bytes(&[b'K'; 64], "S-1-5-21-123", "extensions.settings.absent");
+        assert_eq!(
+            hex,
+            "EE99E5BC40BBBF69703914693BFBA4800B3E66C978F6A5A7BFF742930007C5AF"
+        );
+        assert_eq!(
+            bytes,
+            [
+                0xEE, 0x99, 0xE5, 0xBC, 0x40, 0xBB, 0xBF, 0x69, 0x70, 0x39, 0x14, 0x69, 0x3B, 0xFB,
+                0xA4, 0x80, 0x0B, 0x3E, 0x66, 0xC9, 0x78, 0xF6, 0xA5, 0xA7, 0xBF, 0xF7, 0x42, 0x93,
+                0x00, 0x07, 0xC5, 0xAF,
+            ]
         );
     }
 

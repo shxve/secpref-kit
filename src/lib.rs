@@ -110,7 +110,10 @@ pub use error::SecPrefError;
 pub use ext_id::{
     canonical_extension_path, derive_from_key, derive_from_path, resolve as resolve_ext_id, ExtId,
 };
-pub use mac::{canonicalize, compute_mac, compute_super_mac, strip_empties};
+pub use mac::{
+    canonicalize, compute_absent_mac, compute_absent_mac_bytes, compute_mac, compute_mac_bytes,
+    compute_super_mac, compute_super_mac_bytes, strip_empties,
+};
 pub use prefs::VerifyResult;
 pub use seed::{
     extract_seed_from_pak, extract_seed_from_pak_bytes, extract_seed_from_pak_resource,
