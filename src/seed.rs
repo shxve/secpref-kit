@@ -33,6 +33,43 @@ use crate::SecPrefError;
 /// Length in bytes of the `chrome_seed` embedded in `resources.pak`.
 pub const SEED_LEN: usize = 64;
 
+/// A direct 64-byte `DataPack` resource that may be tested as a seed candidate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SeedResource {
+    id: u32,
+    bytes: [u8; SEED_LEN],
+}
+
+impl SeedResource {
+    /// Direct `DataPack` resource ID.
+    #[must_use]
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Borrow the 64 resource bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; SEED_LEN] {
+        &self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test(id: u32, bytes: [u8; SEED_LEN]) -> Self {
+        Self { id, bytes }
+    }
+}
+
+impl std::fmt::Debug for SeedResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SeedResource")
+            .field("id", &self.id)
+            .field("length", &SEED_LEN)
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
 const DATAPACK_VERSION: u32 = 5;
 const COMPACT_HEADER_LEN: usize = 12;
 const COMPACT_ENTRY_LEN: usize = 6;
@@ -77,6 +114,32 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
             candidates.iter().map(|entry| entry.id).collect(),
         )),
     }
+}
+
+/// Enumerate every direct 64-byte resource as a policy-resolution candidate.
+///
+/// This function does not choose a seed. Callers should pass the returned
+/// resources to [`crate::profile::resolve_profile_policy`], which proves a
+/// unique candidate against the target profile. Aliases are not repeated
+/// because they point at the same direct payload.
+///
+/// # Errors
+///
+/// Returns [`SecPrefError::InvalidPak`] when the `DataPack` is malformed or its
+/// compact/wide layout is ambiguous.
+pub fn seed_resources_from_pak_bytes(data: &[u8]) -> Result<Vec<SeedResource>, SecPrefError> {
+    let pack = parse_data_pack(data)?;
+    Ok(pack
+        .resources
+        .iter()
+        .filter(|entry| entry.end - entry.offset == SEED_LEN)
+        .map(|entry| SeedResource {
+            id: entry.id,
+            bytes: data[entry.offset..entry.end]
+                .try_into()
+                .expect("filtered to the fixed seed length"),
+        })
+        .collect())
 }
 
 /// Read Chromium's named preference-hash seed from a pak on disk.
@@ -443,6 +506,21 @@ mod tests {
             error,
             SecPrefError::AmbiguousSeedCandidates(ids) if ids == vec![10, 20]
         ));
+    }
+
+    #[test]
+    fn enumerates_all_direct_seed_candidates_without_exposing_bytes_in_debug() {
+        let first = [0x11; SEED_LEN];
+        let second = [0x22; SEED_LEN];
+        let pak = synthetic_pak(&[(10, &first), (20, &[0x33; 8]), (30, &second)], &[(40, 2)]);
+
+        let resources = seed_resources_from_pak_bytes(&pak).unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].id(), 10);
+        assert_eq!(resources[0].as_bytes(), &first);
+        assert_eq!(resources[1].id(), 30);
+        assert_eq!(resources[1].as_bytes(), &second);
+        assert!(format!("{:?}", resources[0]).contains("[REDACTED]"));
     }
 
     #[test]

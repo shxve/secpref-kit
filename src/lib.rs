@@ -101,6 +101,7 @@ pub mod ext_id;
 pub mod mac;
 pub mod manifest;
 pub mod prefs;
+pub mod profile;
 pub mod seed;
 
 #[cfg(windows)]
@@ -115,7 +116,12 @@ pub use mac::{
     compute_super_mac, compute_super_mac_bytes, strip_empties,
 };
 pub use prefs::VerifyResult;
+pub use profile::{
+    resolve_profile_policy, IntegrityTopology, LegacyProof, PolicyResolution, PreferenceLayout,
+    ProfileIssue, ResolutionEvidence, ResolvedProfilePolicy, ResolvedSeed, SeedCandidate,
+    SeedSource,
+};
 pub use seed::{
     extract_seed_from_pak, extract_seed_from_pak_bytes, extract_seed_from_pak_resource,
-    extract_seed_from_pak_resource_bytes, SEED_LEN,
+    extract_seed_from_pak_resource_bytes, seed_resources_from_pak_bytes, SeedResource, SEED_LEN,
 };

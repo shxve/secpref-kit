@@ -11,6 +11,7 @@ The library owns:
 
 - Chromium JSON canonicalization and HMAC computation;
 - DataPack v5 seed extraction and validation;
+- adaptive, profile-proven legacy seed and preference-layout resolution;
 - extension manifest parsing, canonical path handling, and ID derivation;
 - in-memory preference mutations, encrypted-hash removal, and verification;
 - Chromium-compatible Windows machine-ID lookup.
@@ -48,6 +49,17 @@ browser-aware consumer.
 9. Manifest permission arrays are shape-checked. MV2 URL-pattern permissions
    are separated into the explicit-host bucket; unsupported parameterized
    dictionary permissions are rejected instead of silently discarded.
+10. Adaptive resolution correlates the extension-record and legacy-MAC trees,
+    deduplicates caller-supplied seed bytes, checks every present or absent MAC
+    leaf, and requires the stored super-MAC to match. It never chooses the first
+    resource or treats a partial match as mutation-capable proof.
+11. `extensions.settings_encrypted_hash` and vendor equivalents are integrity
+    state, not extension-record layouts or legacy per-value MAC leaves. The
+    resolver skips those branches during leaf proof, retains them in the
+    unfiltered super-MAC input, reports their topology, and does not generate
+    proprietary encrypted hashes or claim browser acceptance.
+12. Layout-aware preference operations support a resolved record store while
+    the original APIs remain source-compatible standard-layout wrappers.
 
 ## API and build policy
 
@@ -56,6 +68,9 @@ browser-aware consumer.
 - Errors and externally consumed info types are non-exhaustive.
 - The crate is library-only; it carries no command parser or filesystem write
   policy.
+- Resolution is driven by caller-supplied JSON, device identity, and bounded
+  candidates. Browser/build compatibility certificates, experimental override,
+  restart validation, and rollback remain consumer policy.
 - MSRV is Rust 1.85, matching the resolved dependency floor and exercised by
   CI alongside stable on Ubuntu and Windows. Dependency resolution remains the
   consuming application's responsibility.

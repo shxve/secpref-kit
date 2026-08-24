@@ -33,7 +33,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::{mac, SecPrefError};
+use crate::{mac, profile::PreferenceLayout, SecPrefError};
 
 /// Result of [`verify_extension`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,23 +95,43 @@ pub fn add_extension(
     seed: &[u8],
     device_id: &str,
 ) -> Result<String, SecPrefError> {
-    require_object(prefs_json, "$")?;
-    validate_object_path(prefs_json, &["extensions", "settings"])?;
-    validate_object_path(
+    add_extension_with_layout(
         prefs_json,
-        &["protection", "macs", "extensions", "settings"],
-    )?;
+        &PreferenceLayout::standard(),
+        ext_id,
+        settings,
+        seed,
+        device_id,
+    )
+}
 
-    let path = format!("extensions.settings.{ext_id}");
+/// Add and MAC an extension using a structurally resolved record layout.
+///
+/// This is the layout-aware counterpart of [`add_extension`]. It supports
+/// standard `extensions.settings` and resolved fork-specific stores such as
+/// Opera's `extensions.opsettings` without browser-name branching.
+pub fn add_extension_with_layout(
+    prefs_json: &mut Value,
+    layout: &PreferenceLayout,
+    ext_id: &str,
+    settings: Value,
+    seed: &[u8],
+    device_id: &str,
+) -> Result<String, SecPrefError> {
+    require_object(prefs_json, "$")?;
+    let records_path = path_refs(layout.records_path());
+    let legacy_macs_path = layout.legacy_macs_path();
+    let legacy_macs_refs = path_refs(&legacy_macs_path);
+    validate_object_path(prefs_json, &records_path)?;
+    validate_object_path(prefs_json, &legacy_macs_refs)?;
+
+    let path = layout.extension_path(ext_id);
     let ext_mac = mac::compute_mac(seed, device_id, &path, &settings);
 
-    ensure_object(prefs_json, &["extensions", "settings"])?.insert(ext_id.to_string(), settings);
+    ensure_object(prefs_json, &records_path)?.insert(ext_id.to_string(), settings);
 
-    ensure_object(
-        prefs_json,
-        &["protection", "macs", "extensions", "settings"],
-    )?
-    .insert(ext_id.to_string(), Value::String(ext_mac.clone()));
+    ensure_object(prefs_json, &legacy_macs_refs)?
+        .insert(ext_id.to_string(), Value::String(ext_mac.clone()));
 
     Ok(ext_mac)
 }
@@ -125,12 +145,25 @@ pub fn add_extension(
 /// [`SecPrefError::ExtensionNotFound`] if the ID is not present under
 /// `extensions.settings`.
 pub fn remove_extension(prefs_json: &mut Value, ext_id: &str) -> Result<(), SecPrefError> {
-    let settings = prefs_json
-        .get_mut("extensions")
-        .and_then(|e| e.get_mut("settings"))
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| SecPrefError::UnexpectedShape {
-            path: "extensions.settings".into(),
+    remove_extension_with_layout(prefs_json, &PreferenceLayout::standard(), ext_id)
+}
+
+/// Remove an extension and its MAC using a resolved record layout.
+pub fn remove_extension_with_layout(
+    prefs_json: &mut Value,
+    layout: &PreferenceLayout,
+    ext_id: &str,
+) -> Result<(), SecPrefError> {
+    let records_path = layout.records_path();
+    let legacy_macs_path = layout.legacy_macs_path();
+    let records_refs = path_refs(records_path);
+    let legacy_refs = path_refs(&legacy_macs_path);
+    validate_object_path(prefs_json, &records_refs)?;
+    validate_object_path(prefs_json, &legacy_refs)?;
+
+    let settings =
+        object_at_mut(prefs_json, records_path).ok_or_else(|| SecPrefError::UnexpectedShape {
+            path: records_path.join("."),
             reason: "missing or non-object".into(),
         })?;
 
@@ -138,13 +171,7 @@ pub fn remove_extension(prefs_json: &mut Value, ext_id: &str) -> Result<(), SecP
         return Err(SecPrefError::ExtensionNotFound(ext_id.into()));
     }
 
-    if let Some(macs) = prefs_json
-        .get_mut("protection")
-        .and_then(|p| p.get_mut("macs"))
-        .and_then(|m| m.get_mut("extensions"))
-        .and_then(|e| e.get_mut("settings"))
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(macs) = object_at_mut(prefs_json, &legacy_macs_path) {
         macs.swap_remove(ext_id);
     }
 
@@ -307,22 +334,34 @@ pub fn verify_extension(
     seed: &[u8],
     device_id: &str,
 ) -> Result<VerifyResult, SecPrefError> {
-    let ext_settings = prefs_json
-        .get("extensions")
-        .and_then(|e| e.get("settings"))
-        .and_then(|s| s.get(ext_id))
+    verify_extension_with_layout(
+        prefs_json,
+        &PreferenceLayout::standard(),
+        ext_id,
+        seed,
+        device_id,
+    )
+}
+
+/// Verify an extension using a structurally resolved record layout.
+pub fn verify_extension_with_layout(
+    prefs_json: &Value,
+    layout: &PreferenceLayout,
+    ext_id: &str,
+    seed: &[u8],
+    device_id: &str,
+) -> Result<VerifyResult, SecPrefError> {
+    let legacy_macs_path = layout.legacy_macs_path();
+    let ext_settings = value_at(prefs_json, layout.records_path())
+        .and_then(|settings| settings.get(ext_id))
         .ok_or_else(|| SecPrefError::ExtensionNotFound(ext_id.into()))?;
 
-    let stored_ext_mac = prefs_json
-        .get("protection")
-        .and_then(|p| p.get("macs"))
-        .and_then(|m| m.get("extensions"))
-        .and_then(|e| e.get("settings"))
-        .and_then(|s| s.get(ext_id))
+    let stored_ext_mac = value_at(prefs_json, &legacy_macs_path)
+        .and_then(|macs| macs.get(ext_id))
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    let path = format!("extensions.settings.{ext_id}");
+    let path = layout.extension_path(ext_id);
     let computed_ext_mac = mac::compute_mac(seed, device_id, &path, ext_settings);
     let ext_mac_valid = computed_ext_mac.eq_ignore_ascii_case(stored_ext_mac);
 
@@ -396,9 +435,13 @@ pub fn verify_extension(
 /// list if `extensions.settings` is missing.
 #[must_use]
 pub fn list_extensions(prefs_json: &Value) -> Vec<ExtInfo> {
-    let Some(Value::Object(settings)) =
-        prefs_json.get("extensions").and_then(|e| e.get("settings"))
-    else {
+    list_extensions_with_layout(prefs_json, &PreferenceLayout::standard())
+}
+
+/// List extensions from a structurally resolved record layout.
+#[must_use]
+pub fn list_extensions_with_layout(prefs_json: &Value, layout: &PreferenceLayout) -> Vec<ExtInfo> {
+    let Some(Value::Object(settings)) = value_at(prefs_json, layout.records_path()) else {
         return Vec::new();
     };
 
@@ -459,6 +502,26 @@ fn require_object(value: &Value, path: &str) -> Result<(), SecPrefError> {
             reason: "expected object at root".into(),
         })
     }
+}
+
+fn path_refs(path: &[String]) -> Vec<&str> {
+    path.iter().map(String::as_str).collect()
+}
+
+fn value_at<'a>(root: &'a Value, path: &[String]) -> Option<&'a Value> {
+    let mut current = root;
+    for key in path {
+        current = current.get(key)?;
+    }
+    Some(current)
+}
+
+fn object_at_mut<'a>(root: &'a mut Value, path: &[String]) -> Option<&'a mut Map<String, Value>> {
+    let mut current = root;
+    for key in path {
+        current = current.get_mut(key)?;
+    }
+    current.as_object_mut()
 }
 
 /// Navigate into nested objects, creating intermediate objects as needed.
@@ -577,6 +640,34 @@ mod tests {
             .and_then(|m| m.get("extensions"))
             .and_then(|e| e.get("settings"))
             .and_then(|s| s.get(ext_id))
+            .is_none());
+    }
+
+    #[test]
+    fn layout_aware_operations_support_opera_store() {
+        let mut prefs = json!({});
+        let layout = PreferenceLayout::opera();
+        let ext_id = "abcdefghijklmnopqrstuvwxyzabcdef";
+        let seed = [0x44; 64];
+        let settings = json!({"state": 1, "path": "C:\\ext"});
+
+        add_extension_with_layout(&mut prefs, &layout, ext_id, settings, &seed, "device").unwrap();
+        enable_developer_mode(&mut prefs, &seed, "device").unwrap();
+        recompute_super_mac(&mut prefs, &seed, "device").unwrap();
+
+        assert!(
+            verify_extension_with_layout(&prefs, &layout, ext_id, &seed, "device")
+                .unwrap()
+                .all_valid()
+        );
+        assert_eq!(list_extensions_with_layout(&prefs, &layout).len(), 1);
+        assert!(prefs["extensions"].get("settings").is_none());
+        assert!(prefs["extensions"]["opsettings"].get(ext_id).is_some());
+
+        remove_extension_with_layout(&mut prefs, &layout, ext_id).unwrap();
+        assert!(prefs["extensions"]["opsettings"].get(ext_id).is_none());
+        assert!(prefs["protection"]["macs"]["extensions"]["opsettings"]
+            .get(ext_id)
             .is_none());
     }
 
