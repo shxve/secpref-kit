@@ -10,18 +10,16 @@
 //!
 //! # Layout summary (`DataPack` v5)
 //!
-//! | Offset | Type  | Meaning                          |
-//! |-------:|-------|----------------------------------|
-//! | 0      | `u32` | version (must be 5)              |
-//! | 4      | `u8`  | encoding                         |
-//! | 5      | `[u8; 3]` | padding                     |
-//! | 8      | `u16` | `resource_count`                 |
-//! | 10     | `u16` | `alias_count`                    |
-//! | 12+    | `[u16 id, u32 offset]` × (`resource_count` + 1) | entry table with a sentinel |
-//! | ...    | `u8`  | resource data                    |
+//! Chromium uses a compact layout with a 12-byte header, `u16` counts and
+//! resource IDs, six-byte resource entries, and four-byte aliases. Microsoft
+//! Edge packs observed in the wild use a wide layout with a 16-byte header,
+//! `u32` counts and IDs, eight-byte entries, and eight-byte aliases. Both
+//! layouts store `u32` resource offsets and end the resource table with a
+//! sentinel entry.
 //!
-//! The entry table is followed by `alias_count` four-byte alias records; the
-//! first resource offset must begin at or after both tables.
+//! The parser validates both layouts and accepts one only when it is the unique
+//! structurally valid interpretation. The first resource offset must begin at
+//! or after the entry and alias tables.
 //!
 //! Each resource's length is derived from the difference between its offset
 //! and the next entry's offset.
@@ -36,9 +34,12 @@ use crate::SecPrefError;
 pub const SEED_LEN: usize = 64;
 
 const DATAPACK_VERSION: u32 = 5;
-const HEADER_LEN: usize = 12;
-const ENTRY_LEN: usize = 6; // u16 resource_id + u32 offset
-const ALIAS_LEN: usize = 4; // u16 resource_id + u16 target resource index
+const COMPACT_HEADER_LEN: usize = 12;
+const COMPACT_ENTRY_LEN: usize = 6;
+const COMPACT_ALIAS_LEN: usize = 4;
+const WIDE_HEADER_LEN: usize = 16;
+const WIDE_ENTRY_LEN: usize = 8;
+const WIDE_ALIAS_LEN: usize = 8;
 
 /// Read the seed from a `resources.pak` file on disk.
 ///
@@ -90,7 +91,7 @@ pub fn extract_seed_from_pak_bytes(data: &[u8]) -> Result<Vec<u8>, SecPrefError>
 /// [`SecPrefError::InvalidSeedLength`].
 pub fn extract_seed_from_pak_resource(
     pak_path: impl AsRef<Path>,
-    resource_id: u16,
+    resource_id: u32,
 ) -> Result<Vec<u8>, SecPrefError> {
     let data = fs::read(pak_path)?;
     extract_seed_from_pak_resource_bytes(&data, resource_id)
@@ -108,7 +109,7 @@ pub fn extract_seed_from_pak_resource(
 /// [`SecPrefError::InvalidSeedLength`].
 pub fn extract_seed_from_pak_resource_bytes(
     data: &[u8],
-    resource_id: u16,
+    resource_id: u32,
 ) -> Result<Vec<u8>, SecPrefError> {
     let pack = parse_data_pack(data)?;
     let entry = pack
@@ -140,25 +141,99 @@ struct DataPack {
 
 #[derive(Debug)]
 struct ResourceEntry {
-    id: u16,
+    id: u32,
     offset: usize,
     end: usize,
 }
 
 #[derive(Debug)]
 struct AliasEntry {
-    id: u16,
+    id: u32,
     target_index: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DataPackLayout {
+    Compact,
+    Wide,
+}
+
+impl DataPackLayout {
+    const fn header_len(self) -> usize {
+        match self {
+            Self::Compact => COMPACT_HEADER_LEN,
+            Self::Wide => WIDE_HEADER_LEN,
+        }
+    }
+
+    const fn entry_len(self) -> usize {
+        match self {
+            Self::Compact => COMPACT_ENTRY_LEN,
+            Self::Wide => WIDE_ENTRY_LEN,
+        }
+    }
+
+    const fn alias_len(self) -> usize {
+        match self {
+            Self::Compact => COMPACT_ALIAS_LEN,
+            Self::Wide => WIDE_ALIAS_LEN,
+        }
+    }
+
+    fn counts(self, data: &[u8]) -> (usize, usize) {
+        match self {
+            Self::Compact => (
+                u16::from_le_bytes(data[8..10].try_into().expect("checked compact header"))
+                    as usize,
+                u16::from_le_bytes(data[10..12].try_into().expect("checked compact header"))
+                    as usize,
+            ),
+            Self::Wide => (
+                u32::from_le_bytes(data[8..12].try_into().expect("checked wide header")) as usize,
+                u32::from_le_bytes(data[12..16].try_into().expect("checked wide header")) as usize,
+            ),
+        }
+    }
+
+    fn entry(self, data: &[u8], base: usize) -> (u32, usize) {
+        match self {
+            Self::Compact => (
+                u16::from_le_bytes(data[base..base + 2].try_into().expect("bounded entry")).into(),
+                u32::from_le_bytes(data[base + 2..base + 6].try_into().expect("bounded entry"))
+                    as usize,
+            ),
+            Self::Wide => (
+                u32::from_le_bytes(data[base..base + 4].try_into().expect("bounded entry")),
+                u32::from_le_bytes(data[base + 4..base + 8].try_into().expect("bounded entry"))
+                    as usize,
+            ),
+        }
+    }
+
+    fn alias(self, data: &[u8], base: usize) -> (u32, usize) {
+        match self {
+            Self::Compact => (
+                u16::from_le_bytes(data[base..base + 2].try_into().expect("bounded alias")).into(),
+                u16::from_le_bytes(data[base + 2..base + 4].try_into().expect("bounded alias"))
+                    as usize,
+            ),
+            Self::Wide => (
+                u32::from_le_bytes(data[base..base + 4].try_into().expect("bounded alias")),
+                u32::from_le_bytes(data[base + 4..base + 8].try_into().expect("bounded alias"))
+                    as usize,
+            ),
+        }
+    }
+}
+
 fn parse_data_pack(data: &[u8]) -> Result<DataPack, SecPrefError> {
-    if data.len() < HEADER_LEN {
+    if data.len() < COMPACT_HEADER_LEN {
         return Err(SecPrefError::InvalidPak(
             "resources.pak too small for DataPack v5 header".into(),
         ));
     }
 
-    let version = u32::from_le_bytes(data[0..4].try_into().expect("checked len ≥ 12"));
+    let version = u32::from_le_bytes(data[0..4].try_into().expect("checked compact header"));
     if version != DATAPACK_VERSION {
         return Err(SecPrefError::InvalidPak(format!(
             "expected DataPack version {DATAPACK_VERSION}, got {version}"
@@ -172,71 +247,65 @@ fn parse_data_pack(data: &[u8]) -> Result<DataPack, SecPrefError> {
         )));
     }
 
-    let resource_count =
-        u16::from_le_bytes(data[8..10].try_into().expect("checked len ≥ 12")) as usize;
-    let alias_count =
-        u16::from_le_bytes(data[10..12].try_into().expect("checked len ≥ 12")) as usize;
+    let compact = parse_layout(data, DataPackLayout::Compact);
+    let wide = parse_layout(data, DataPackLayout::Wide);
+    match (compact, wide) {
+        (Ok(pack), Err(_)) | (Err(_), Ok(pack)) => Ok(pack),
+        (Ok(_), Ok(_)) => Err(SecPrefError::InvalidPak(
+            "ambiguous DataPack v5 table layout".into(),
+        )),
+        (Err(compact_error), Err(wide_error)) => Err(SecPrefError::InvalidPak(format!(
+            "invalid compact and wide DataPack v5 layouts (compact: {compact_error}; wide: {wide_error})"
+        ))),
+    }
+}
+
+fn parse_layout(data: &[u8], layout: DataPackLayout) -> Result<DataPack, String> {
+    let header_len = layout.header_len();
+    if data.len() < header_len {
+        return Err(format!("file too small for {layout:?} header"));
+    }
+    let entry_len = layout.entry_len();
+    let alias_len = layout.alias_len();
+    let (resource_count, alias_count) = layout.counts(data);
 
     // +1 sentinel entry gives every real entry a "next offset" to subtract.
     let total_entries = resource_count
         .checked_add(1)
-        .ok_or_else(|| SecPrefError::InvalidPak("resource_count + 1 overflows usize".into()))?;
+        .ok_or_else(|| "resource_count + 1 overflows usize".to_owned())?;
     let entries_bytes = total_entries
-        .checked_mul(ENTRY_LEN)
-        .ok_or_else(|| SecPrefError::InvalidPak("entry table size overflows usize".into()))?;
+        .checked_mul(entry_len)
+        .ok_or_else(|| "entry table size overflows usize".to_owned())?;
     let alias_bytes = alias_count
-        .checked_mul(ALIAS_LEN)
-        .ok_or_else(|| SecPrefError::InvalidPak("alias table size overflows usize".into()))?;
-    let data_start = HEADER_LEN
+        .checked_mul(alias_len)
+        .ok_or_else(|| "alias table size overflows usize".to_owned())?;
+    let data_start = header_len
         .checked_add(entries_bytes)
         .and_then(|size| size.checked_add(alias_bytes))
-        .ok_or_else(|| SecPrefError::InvalidPak("DataPack table size overflows usize".into()))?;
+        .ok_or_else(|| "DataPack table size overflows usize".to_owned())?;
     if data.len() < data_start {
-        return Err(SecPrefError::InvalidPak(
-            "resources.pak truncated: not enough entry or alias data".into(),
-        ));
+        return Err("not enough entry or alias data".into());
     }
 
     let mut resources = Vec::with_capacity(resource_count);
     for i in 0..resource_count {
-        let base = HEADER_LEN + i * ENTRY_LEN;
-        let id = u16::from_le_bytes(
-            data[base..base + 2]
-                .try_into()
-                .expect("bounded by entries_bytes"),
-        );
-        let offset = u32::from_le_bytes(
-            data[base + 2..base + 6]
-                .try_into()
-                .expect("bounded by entries_bytes"),
-        ) as usize;
-        let next_base = HEADER_LEN + (i + 1) * ENTRY_LEN;
-        let next_offset = u32::from_le_bytes(
-            data[next_base + 2..next_base + 6]
-                .try_into()
-                .expect("bounded by entries_bytes (+ sentinel)"),
-        ) as usize;
+        let base = header_len + i * entry_len;
+        let (id, offset) = layout.entry(data, base);
+        let next_base = header_len + (i + 1) * entry_len;
+        let (_, next_offset) = layout.entry(data, next_base);
 
         if offset < data_start {
-            return Err(SecPrefError::InvalidPak(format!(
-                "resource {i} offset points inside DataPack tables"
-            )));
+            return Err(format!("resource {i} offset points inside DataPack tables"));
         }
         if next_offset < offset {
-            return Err(SecPrefError::InvalidPak(format!(
-                "resource offsets are not monotonic at entry {i}"
-            )));
+            return Err(format!("resource offsets are not monotonic at entry {i}"));
         }
         if next_offset > data.len() {
-            return Err(SecPrefError::InvalidPak(
-                "resource offset exceeds file size".into(),
-            ));
+            return Err("resource offset exceeds file size".into());
         }
 
         if resources.iter().any(|entry: &ResourceEntry| entry.id == id) {
-            return Err(SecPrefError::InvalidPak(format!(
-                "duplicate resource ID {id}"
-            )));
+            return Err(format!("duplicate resource ID {id}"));
         }
         resources.push(ResourceEntry {
             id,
@@ -245,7 +314,13 @@ fn parse_data_pack(data: &[u8]) -> Result<DataPack, SecPrefError> {
         });
     }
 
-    let aliases = parse_aliases(data, HEADER_LEN + entries_bytes, alias_count, &resources)?;
+    let aliases = parse_aliases(
+        data,
+        header_len + entries_bytes,
+        alias_count,
+        &resources,
+        layout,
+    )?;
 
     Ok(DataPack { resources, aliases })
 }
@@ -255,31 +330,21 @@ fn parse_aliases(
     alias_start: usize,
     alias_count: usize,
     resources: &[ResourceEntry],
-) -> Result<Vec<AliasEntry>, SecPrefError> {
+    layout: DataPackLayout,
+) -> Result<Vec<AliasEntry>, String> {
     let mut aliases = Vec::with_capacity(alias_count);
     for i in 0..alias_count {
-        let base = alias_start + i * ALIAS_LEN;
-        let id = u16::from_le_bytes(
-            data[base..base + 2]
-                .try_into()
-                .expect("bounded by alias_bytes"),
-        );
-        let target_index = u16::from_le_bytes(
-            data[base + 2..base + 4]
-                .try_into()
-                .expect("bounded by alias_bytes"),
-        ) as usize;
+        let base = alias_start + i * layout.alias_len();
+        let (id, target_index) = layout.alias(data, base);
         if target_index >= resources.len() {
-            return Err(SecPrefError::InvalidPak(format!(
+            return Err(format!(
                 "alias resource {id} targets missing entry index {target_index}"
-            )));
+            ));
         }
         if resources.iter().any(|entry| entry.id == id)
             || aliases.iter().any(|alias: &AliasEntry| alias.id == id)
         {
-            return Err(SecPrefError::InvalidPak(format!(
-                "duplicate resource or alias ID {id}"
-            )));
+            return Err(format!("duplicate resource or alias ID {id}"));
         }
         aliases.push(AliasEntry { id, target_index });
     }
@@ -307,14 +372,43 @@ mod tests {
         buf.extend_from_slice(&(resources.len() as u16).to_le_bytes());
         buf.extend_from_slice(&(aliases.len() as u16).to_le_bytes());
 
-        let mut offset =
-            (HEADER_LEN + (resources.len() + 1) * ENTRY_LEN + aliases.len() * ALIAS_LEN) as u32;
+        let mut offset = (COMPACT_HEADER_LEN
+            + (resources.len() + 1) * COMPACT_ENTRY_LEN
+            + aliases.len() * COMPACT_ALIAS_LEN) as u32;
         for (id, payload) in resources {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&offset.to_le_bytes());
             offset += payload.len() as u32;
         }
         buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&offset.to_le_bytes());
+        for (id, target_index) in aliases {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&target_index.to_le_bytes());
+        }
+        for (_, payload) in resources {
+            buf.extend_from_slice(payload);
+        }
+        buf
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_wide_pak(resources: &[(u32, &[u8])], aliases: &[(u32, u32)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&DATAPACK_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(resources.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(aliases.len() as u32).to_le_bytes());
+
+        let mut offset = (WIDE_HEADER_LEN
+            + (resources.len() + 1) * WIDE_ENTRY_LEN
+            + aliases.len() * WIDE_ALIAS_LEN) as u32;
+        for (id, payload) in resources {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+            offset += payload.len() as u32;
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&offset.to_le_bytes());
         for (id, target_index) in aliases {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -368,8 +462,38 @@ mod tests {
     }
 
     #[test]
+    fn extracts_wide_resource_and_alias_above_u16_range() {
+        let unrelated = [0x11; 17];
+        let seed = [0x22; SEED_LEN];
+        // IDs mirror the range observed in Edge 151 resources.pak, while the
+        // payload is synthetic and contains no vendor resource data.
+        let pak = synthetic_wide_pak(&[(65_554, &unrelated), (65_840, &seed)], &[(70_001, 1)]);
+
+        assert_eq!(extract_seed_from_pak_bytes(&pak).unwrap(), seed);
+        assert_eq!(
+            extract_seed_from_pak_resource_bytes(&pak, 65_840).unwrap(),
+            seed
+        );
+        assert_eq!(
+            extract_seed_from_pak_resource_bytes(&pak, 70_001).unwrap(),
+            seed
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_wide_alias_target() {
+        let seed = [0x22; SEED_LEN];
+        let pak = synthetic_wide_pak(&[(65_840, &seed)], &[(70_001, 1)]);
+
+        assert!(matches!(
+            extract_seed_from_pak_bytes(&pak),
+            Err(SecPrefError::InvalidPak(_))
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_version() {
-        let mut pak = vec![0u8; HEADER_LEN];
+        let mut pak = vec![0u8; COMPACT_HEADER_LEN];
         pak[0..4].copy_from_slice(&4u32.to_le_bytes()); // v4, not v5
         let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
         assert!(matches!(err, SecPrefError::InvalidPak(_)));
@@ -384,7 +508,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_encoding() {
-        let mut pak = vec![0u8; HEADER_LEN];
+        let mut pak = vec![0u8; COMPACT_HEADER_LEN];
         pak[0..4].copy_from_slice(&DATAPACK_VERSION.to_le_bytes());
         pak[4..8].copy_from_slice(&3u32.to_le_bytes());
         let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
@@ -413,7 +537,7 @@ mod tests {
     fn rejects_descending_resource_offsets() {
         let seed = [0xAB; SEED_LEN];
         let mut pak = synthetic_pak_with_seed(&seed);
-        let data_start = u32::try_from(HEADER_LEN + 2 * ENTRY_LEN).unwrap();
+        let data_start = u32::try_from(COMPACT_HEADER_LEN + 2 * COMPACT_ENTRY_LEN).unwrap();
         pak[20..24].copy_from_slice(&(data_start - 1).to_le_bytes());
         let err = extract_seed_from_pak_bytes(&pak).unwrap_err();
         assert!(matches!(err, SecPrefError::InvalidPak(_)));
@@ -428,7 +552,7 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
-        let data_start = (HEADER_LEN + 2 * ENTRY_LEN) as u32;
+        let data_start = (COMPACT_HEADER_LEN + 2 * COMPACT_ENTRY_LEN) as u32;
         let data_end = data_start + 32;
         buf.extend_from_slice(&1u16.to_le_bytes());
         buf.extend_from_slice(&data_start.to_le_bytes());

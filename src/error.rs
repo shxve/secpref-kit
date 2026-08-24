@@ -20,17 +20,17 @@ pub enum SecPrefError {
     /// More than one 64-byte resource exists, so length alone cannot identify
     /// Chromium's named preference-hash seed.
     #[error("multiple 64-byte seed candidates in resources.pak: {0:?}")]
-    AmbiguousSeedCandidates(Vec<u16>),
+    AmbiguousSeedCandidates(Vec<u32>),
 
     /// The caller-supplied Chromium resource ID was not present in the pak.
     #[error("resource ID {0} not found in resources.pak")]
-    SeedResourceNotFound(u16),
+    SeedResourceNotFound(u32),
 
     /// The selected named resource did not contain a 64-byte seed.
     #[error("resource ID {resource_id} has length {actual}, expected 64")]
     InvalidSeedLength {
         /// `DataPack` resource ID requested by the caller.
-        resource_id: u16,
+        resource_id: u32,
         /// Actual resource payload length.
         actual: usize,
     },

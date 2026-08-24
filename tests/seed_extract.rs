@@ -9,6 +9,9 @@ use secpref_kit::{
 const HEADER_LEN: usize = 12;
 const ENTRY_LEN: usize = 6;
 const DATAPACK_VERSION: u32 = 5;
+const WIDE_HEADER_LEN: usize = 16;
+const WIDE_ENTRY_LEN: usize = 8;
+const WIDE_ALIAS_LEN: usize = 8;
 
 fn synthetic_pak_with_resource(payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -22,6 +25,24 @@ fn synthetic_pak_with_resource(payload: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&data_start.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&data_end.to_le_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+fn synthetic_wide_pak_with_alias(resource_id: u32, alias_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&DATAPACK_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // encoding
+    buf.extend_from_slice(&1u32.to_le_bytes()); // resource_count = 1
+    buf.extend_from_slice(&1u32.to_le_bytes()); // alias_count = 1
+    let data_start = (WIDE_HEADER_LEN + 2 * WIDE_ENTRY_LEN + WIDE_ALIAS_LEN) as u32;
+    let data_end = data_start + payload.len() as u32;
+    buf.extend_from_slice(&resource_id.to_le_bytes());
+    buf.extend_from_slice(&data_start.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&data_end.to_le_bytes());
+    buf.extend_from_slice(&alias_id.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(payload);
     buf
 }
@@ -48,6 +69,21 @@ fn exact_resource_id_must_exist() {
     let pak = synthetic_pak_with_resource(&seed);
     let error = extract_seed_from_pak_resource_bytes(&pak, 99).unwrap_err();
     assert!(matches!(error, SecPrefError::SeedResourceNotFound(99)));
+}
+
+#[test]
+fn extracts_edge_style_wide_resource_and_alias() {
+    let seed = [0xD7u8; SEED_LEN];
+    let pak = synthetic_wide_pak_with_alias(65_840, 70_001, &seed);
+
+    assert_eq!(
+        extract_seed_from_pak_resource_bytes(&pak, 65_840).unwrap(),
+        seed
+    );
+    assert_eq!(
+        extract_seed_from_pak_resource_bytes(&pak, 70_001).unwrap(),
+        seed
+    );
 }
 
 #[test]

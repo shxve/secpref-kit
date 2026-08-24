@@ -7,9 +7,9 @@ complete browser-aware tool and serves as the reference consumer.
 ## Capabilities
 
 - Compute per-value MACs and the top-level `super_mac`.
-- Parse DataPack v5 `resources.pak` files and extract `chrome_seed` by the
-  build-matched `IDR_PREF_HASH_SEED_BIN` resource ID, or by a unique-candidate
-  compatibility check.
+- Parse compact Chromium and wide-ID Edge DataPack v5 `resources.pak` files,
+  then extract `chrome_seed` by the build-matched `IDR_PREF_HASH_SEED_BIN`
+  resource ID or by a unique-candidate compatibility check.
 - Canonicalize extension paths and derive extension IDs.
 - Parse manifests and build unpacked-extension settings.
 - Add, remove, list, and verify extension preference entries.
